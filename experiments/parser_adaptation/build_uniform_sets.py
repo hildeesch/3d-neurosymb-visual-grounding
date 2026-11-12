@@ -1,6 +1,7 @@
-"""Build fixed-budget mlx_lm.lora training sets from verified winners.
+"""Build fixed-budget LoRA training sets from verified winners.
 
-Weighting duplicates prompts because mlx_lm.lora has no per-example weight.
+Weighting duplicates prompts because the trainer (train_lora.py, which mirrors
+mlx_lm.lora) has no per-example weight.
 Each arm uses the same per-prompt budget and a fixed seed; the validation split
 holds out complete prompts. The margin and random controls are size-matched.
 """
@@ -126,7 +127,7 @@ def spread(prompts: list[int], total: int, seed: int) -> dict[int, int]:
 
 
 def example(row: dict, system: str, repeat: int, source: str) -> dict:
-    """One mlx_lm.lora chat row, in the control set's exact shape."""
+    """One chat row for train_lora.py, in the control set's exact shape."""
     return {
         "messages": [
             {"role": "system", "content": system},

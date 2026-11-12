@@ -26,11 +26,23 @@ evaluation = [
     "tqdm",
     "transformers==4.17.0",
 ]
+# Parser generation and LoRA training (PyTorch + Hugging Face). Install torch
+# for your CUDA version first if pip's default wheel does not match your driver:
+# https://pytorch.org/get-started/locally/
 training = [
-    "mlx==0.31.2",
-    "mlx-lm==0.31.3",
+    "torch>=2.4",
+    "transformers>=4.51",   # Qwen3 support
+    "peft>=0.13",
+    "accelerate>=1.0",
+    "safetensors>=0.4",
+    "numpy",
     "PyYAML==6.0.3",
+    "openai>=1.40",         # optional GPT-4o teacher backend
     "wandb==0.27.0",
+]
+# 4-/8-bit weight quantisation for large teachers (Linux + NVIDIA GPU)
+quantization = [
+    "bitsandbytes>=0.45",
 ]
 test = [
     "pytest",

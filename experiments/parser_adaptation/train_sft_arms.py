@@ -4,7 +4,8 @@
 Defaults are 1000 updates, batch size 4 and the shared LoRA YAML. The margin and
 size-matched random controls compare selection; prompt-uniform, hard150 and
 hard200 compare sampling weights. Completion requires the final-save log marker,
-not merely a checkpoint file. See README.md for inputs and scoring."""
+not merely a checkpoint file. Training runs train_lora.py (PyTorch + PEFT),
+which takes the mlx_lm lora flags. See README.md for inputs and scoring."""
 
 from __future__ import annotations
 
@@ -80,7 +81,7 @@ def finished(name: str, logs: Path) -> bool:
 
 def command(arm: dict, sets_dir: Path, adapters: Path, wandb: bool) -> list[str]:
     cmd = [
-        sys.executable, "-m", "mlx_lm", "lora",
+        sys.executable, "-m", "experiments.parser_adaptation.train_lora",
         "--model", MODEL, "--train",
         "--data", str(sets_dir / arm["name"]),
         # Per-(arm, seed) adapter dir so three runs of one arm do not overwrite each other
@@ -93,7 +94,7 @@ def command(arm: dict, sets_dir: Path, adapters: Path, wandb: bool) -> list[str]
         "--steps-per-report", str(STEPS_PER_REPORT),
         "--val-batches", str(VAL_BATCHES),
         "--seed", str(arm["seed"]),
-        # Activation checkpointing keeps the retained runs within Metal memory
+        # Activation checkpointing keeps the retained runs within GPU memory
         "--grad-checkpoint",
     ]
     if wandb:

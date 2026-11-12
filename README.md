@@ -15,11 +15,48 @@ source .venv/bin/activate
 python -m pip install -e ".[evaluation]"
 ```
 
-For MLX parser generation and LoRA training, use a separate Apple Silicon
-environment with `pip install -e ".[training]"`. The evaluation dependencies pin
-an older Transformers version and should not be combined with the training extra.
-Checkpoint scoring also needs compatible evaluation packages; that combined
-setup is not specified here. Dependency versions are not a validated lock.
+Parser generation and LoRA training run on PyTorch (Linux/CUDA, CPU fallback),
+in a separate environment:
+
+```bash
+python -m venv .venv-train && source .venv-train/bin/activate
+python -m pip install -e ".[training]"          # add ,quantization for 4/8-bit
+```
+
+The evaluation dependencies pin an older Transformers version and should not be
+combined with the training extra. Checkpoint scoring also needs compatible
+evaluation packages; that combined setup is not specified here. Dependency
+versions are not a validated lock.
+
+### Hardware
+
+| Step | Model | Approx. memory |
+| --- | --- | --- |
+| Student parsing / scoring | Qwen3-1.7B (+ LoRA) | ~4 GB GPU (bf16), or CPU |
+| Student LoRA training | Qwen3-1.7B, batch 4, `--grad-checkpoint` | ~6–8 GB GPU |
+| Teacher rollouts | Qwen3-30B-A3B, `--quantize 4bit` | ~18 GB GPU; with less, layers spill to CPU RAM (slow) |
+| Teacher rollouts | `--backend openai` (GPT-4o) | none locally; needs `OPENAI_API_KEY` |
+
+Check your GPU with `nvidia-smi`. All generators take `--device`, `--dtype`
+and `--quantize`.
+
+### Moving from the MLX version
+
+The pipeline originally ran on Apple Silicon with MLX. It now uses PyTorch,
+Transformers and PEFT; command-line flags are unchanged except where noted.
+
+- Models are Hugging Face ids: `Qwen/Qwen3-30B-A3B` (with `--quantize 4bit`)
+  replaces `mlx-community/Qwen3-30B-A3B-4bit`.
+- Sampling is pure temperature sampling (top-p/top-k off), as MLX's sampler
+  was, and is now seeded (`--seed`). Outputs are not token-identical to MLX runs.
+- Old MLX adapters convert to PEFT without retraining:
+  `python scripts/prepare/convert_mlx_adapter.py <mlx_adapter_dir> <peft_dir>`.
+- `train_lora.py` replaces `mlx_lm lora` and takes the same flags and YAML. It
+  differs in a few details (Adam bias correction, loss over real tokens only,
+  LoRA init); see its docstring. Retrained adapters will not reproduce the MLX
+  numbers exactly.
+- Parse and rollout files record `backend` in their `.meta.json`; resuming
+  into a file written by the MLX version is refused.
 
 Data, model weights, adapters and generated results are not included. You need:
 
@@ -57,14 +94,57 @@ Feature building replaces the cache for that system and split. Evaluate using
 the same parses. `--totals parses` scores the supplied subset; `--totals official`
 counts missing test parses as misses.
 
-To generate parses in the MLX environment:
+To generate parses in the training environment:
 
 ```bash
 python -m experiments.parser_adaptation.parse_split \
   --representation extended --style teacher --prompt v4 \
-  --model mlx-community/Qwen3-30B-A3B-4bit \
+  --model Qwen/Qwen3-30B-A3B --quantize 4bit \
   --rows data/corpora/nr3d_test.csv --out data/parses/test/nr3d_test_30b_v4.jsonl
 ```
+
+The same zero-shot parse with GPT-4o (`OPENAI_API_KEY` must be set):
+
+```bash
+python -m experiments.parser_adaptation.parse_split \
+  --representation extended --style teacher --prompt v4 --backend openai \
+  --rows data/corpora/nr3d_test.csv --out data/parses/test/nr3d_test_gpt4o_v4.jsonl
+```
+
+### Comparing teachers
+
+Teacher rollouts can come from the local Qwen model or from GPT-4o. Both write
+the same row format, so the rest of the pipeline is shared; give each teacher
+its own file names:
+
+```bash
+# Qwen3-30B teacher (local)
+python -m experiments.parser_adaptation.generate_rollouts --prompt v4 \
+  --limit 8750 --n-samples 8 --temp 0.7 --quantize 4bit \
+  --output data/rollouts/nr3d_rollouts_qwen30b_v4.jsonl
+# GPT-4o teacher (API)
+python -m experiments.parser_adaptation.generate_rollouts --prompt v4 \
+  --limit 8750 --n-samples 8 --temp 0.7 --backend openai \
+  --output data/rollouts/nr3d_rollouts_gpt4o_v4.jsonl
+
+# then, per teacher, with matching names:
+python -m experiments.parser_adaptation.filter_rollouts --representation extended \
+  --rollouts data/rollouts/nr3d_rollouts_gpt4o_v4.jsonl \
+  --output data/distilled/nr3d_keepers_gpt4o_v4_ext.jsonl
+python -m experiments.parser_adaptation.build_winner_pool \
+  --keepers data/distilled/nr3d_keepers_gpt4o_v4_ext.jsonl \
+  --output data/distilled/nr3d_winners_gpt4o_v4_ext.jsonl
+python -m experiments.parser_adaptation.build_uniform_sets \
+  --pool data/distilled/nr3d_winners_gpt4o_v4_ext.jsonl \
+  --out data/training_sets_gpt4o
+python -m experiments.parser_adaptation.train_sft_arms --sets data/training_sets_gpt4o \
+  --adapters artifacts/adapters_gpt4o --logs runs/logs_gpt4o
+```
+
+The frozen validation split is defined by prompt id; `build_uniform_sets` stops
+if a teacher's winner pool does not cover every frozen validation prompt. Keep
+the rollout files and their `.meta.json` (snapshot, seed, `system_fingerprint`):
+the frozen file is what makes an API teacher reproducible.
 
 The experiments are grouped by contribution:
 
@@ -87,7 +167,8 @@ python -m experiments.reference_frame --help
 Training uses the R=8 teacher pool and the IDs in
 `experiments/parser_adaptation/validation_split.json`. Recovery rollouts are
 excluded. Remove `--dry-run` to train; select adapters on dev data, then pass the
-chosen adapter to `parse_split --style sft --adapter <path>`.
+chosen adapter to `parse_split --style sft --adapter <path>`. Adapters are PEFT
+directories; checkpoints are saved as `<adapter>/NNNNNNN_adapters/`.
 
 Checkpoint selection credits every top tie; headline evaluation selects one
 candidate with `torch.topk`. Preserve the scoring settings and row-level results

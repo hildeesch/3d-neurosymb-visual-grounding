@@ -337,39 +337,30 @@ def make_generator(
     temperature: float,
     max_tokens: int,
     enable_thinking: bool,
+    *,
+    seed: int | None = 0,
+    quantize: str = "none",
+    device: str | None = None,
+    dtype: str | None = None,
 ):
     try:
-        from mlx_lm import generate, load
+        from grounding.parsing.generation import batch_generate, load_model
+        import torch  # noqa: F401
     except ImportError as e:
         raise SystemExit(
-            "mlx-lm is not installed in this environment. Use the same "
-            "environment as your existing local Qwen parser."
+            "torch/transformers are not installed in this environment. Use the "
+            "same environment as the local Qwen parser (pip install -e "
+            "'.[training]')."
         ) from e
 
-    model, tokenizer = load(model_id)
-
-    try:
-        from mlx_lm.sample_utils import make_sampler
-    except ImportError:
-        # Older mlx-lm releases expose only the generator's default sampler
-        sampler = None
-    else:
-        sampler = make_sampler(temp=temperature)
+    model, tokenizer, sampler = load_model(
+        model_id, temperature=temperature, seed=seed, quantize=quantize,
+        device=device, dtype=dtype)
 
     def run(sentence: str) -> str:
         prompt = build_prompt(tokenizer, sentence, enable_thinking)
-
-        kwargs = {
-            "model": model,
-            "tokenizer": tokenizer,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "verbose": False,
-        }
-        if sampler is not None:
-            kwargs["sampler"] = sampler
-
-        return generate(**kwargs)
+        return batch_generate(model, tokenizer, [prompt], max_tokens=max_tokens,
+                              sampler=sampler).texts[0]
 
     return run
 
@@ -389,9 +380,12 @@ def parse_invocation(args, rows, git_commit=None) -> dict:
         "prompt": "reference_frame.build_prompt (frame schema), frozen in this file",
         # Recorded so a consumer can prove a frame pass came from THIS prompt
         "prompt_sha256": hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest(),
+        "backend": "hf",
         "decoding": {"sampler": "greedy" if args.temperature == 0 else "sampled",
                      "temperature": args.temperature, "max_tokens": args.max_tokens,
-                     "thinking": bool(args.thinking)},
+                     "thinking": bool(args.thinking),
+                     "seed": getattr(args, "seed", None),
+                     "quantize": getattr(args, "quantize", "none")},
     }
 
 
@@ -411,6 +405,10 @@ def cmd_parse(args) -> int:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         enable_thinking=args.thinking,
+        seed=args.seed,
+        quantize=args.quantize,
+        device=args.device,
+        dtype=args.dtype,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

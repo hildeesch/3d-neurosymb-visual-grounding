@@ -2,6 +2,11 @@
 
 Lowering uses the selected representation's vocabulary. Rebuild features from
 the output before evaluation; existing rows are skipped unless ``--fresh`` is set.
+
+``--backend hf`` (default) runs a local Hugging Face model through PyTorch, with
+an optional PEFT LoRA ``--adapter``. ``--backend openai`` sends the same system
+prompt and user turn to an OpenAI chat model (greedy, T=0) for the zero-shot
+``teacher``/``fused`` styles, so an API parser can be compared on equal terms.
 """
 from __future__ import annotations
 
@@ -20,7 +25,10 @@ from grounding.parsing import (REPRESENTATIONS, extract_json_objects, load_rel_n
                                lower_one, normalise_representation,
                                sft_user_turn)
 from grounding.parsing import PROMPTS
-from grounding.parsing.generation import encode_chat, load_model, template_prompt
+from grounding.parsing.generation import (add_model_args, batch_generate,
+                                          encode_chat, free_memory, load_model,
+                                          template_prompt)
+from grounding.parsing.openai_backend import DEFAULT_OPENAI_MODEL
 from grounding.resolution.artifacts import git_commit, sha256
 
 # style -> (default prompt version, chat-template?, user message, recover?)
@@ -82,13 +90,16 @@ def invocation(args, rows_path: Path, version: str, system: str,
         "rows": {"path": str(rows_path.relative_to(REPO_ROOT))
                  if rows_path.is_relative_to(REPO_ROOT) else str(rows_path),
                  "sha256": sha256(rows_path), "n": n_rows, "limit": args.limit},
+        "backend": args.backend,
         "model": args.model, "adapter": args.adapter,
         "representation": representation,
         "style": args.style, "prompt": version,
         "prompt_sha256": hashlib.sha256(system.encode()).hexdigest(),
         "decoding": {"sampler": "greedy", "temp": 0.0,
                      "max_tokens": args.max_tokens, "batch_size": args.batch_size,
-                     "no_think": bool(args.no_think)},
+                     "no_think": bool(args.no_think),
+                     **({"quantize": args.quantize, "dtype": args.dtype}
+                        if args.backend == "hf" else {"seed": args.seed})},
     }
 
 
@@ -119,9 +130,16 @@ def main() -> int:
                     help="utterances to parse: the test csv, or a probe jsonl")
     # Defaults describe the zero-shot 1.7B student; the full system supplies --adapter explicitly
     ap.add_argument("--out", default="data/parses/test/nr3d_test_qwen3_1p7b_v4_ext.jsonl")
-    ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    ap.add_argument("--backend", choices=["hf", "openai"], default="hf",
+                    help="hf: local PyTorch model; openai: OpenAI chat API "
+                         "(teacher/fused styles only)")
+    ap.add_argument("--model", default=None,
+                    help="default: Qwen/Qwen3-1.7B (hf) or "
+                         f"{DEFAULT_OPENAI_MODEL} (openai)")
     ap.add_argument("--adapter", default=None,
-                    help="optional MLX LoRA adapter directory")
+                    help="optional PEFT LoRA adapter directory (hf only); "
+                         "convert old MLX adapters with "
+                         "scripts/prepare/convert_mlx_adapter.py")
     ap.add_argument("--style", default="sft", choices=sorted(STYLES),
                     help="prompt formatting recipe; see the module docstring")
     ap.add_argument("--prompt", default=None, choices=sorted(PROMPTS),
@@ -136,7 +154,20 @@ def main() -> int:
     ap.add_argument("--no-think", action="store_true",
                     help="append ' /no_think' to each prompt. Required for a "
                          "RAW Qwen3 base; omit for SFT-derived models.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="openai: request seed (best-effort determinism)")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="openai: concurrent requests")
+    add_model_args(ap)
     args = ap.parse_args()
+    args.model = args.model or (DEFAULT_OPENAI_MODEL if args.backend == "openai"
+                                else "Qwen/Qwen3-1.7B")
+    if args.backend == "openai":
+        if args.style == "sft":
+            ap.error("--backend openai needs --style teacher or fused; the sft "
+                     "style is the fine-tuned local student's format")
+        if args.adapter or args.no_think:
+            ap.error("--adapter and --no-think apply to --backend hf only")
 
     rows_path = Path(args.rows)
     rows_path = rows_path if rows_path.is_absolute() else REPO_ROOT / rows_path
@@ -177,7 +208,7 @@ def main() -> int:
                 "to start over, or a different --out.")
         recorded = json.loads(meta_path.read_text())
         drift = {k: (recorded.get(k), meta[k]) for k in
-                 ("rows", "model", "adapter", "representation", "style",
+                 ("rows", "backend", "model", "adapter", "representation", "style",
                   "prompt", "prompt_sha256", "decoding")
                  if recorded.get(k) != meta[k]}
         if drift:
@@ -201,18 +232,40 @@ def main() -> int:
         print("Nothing to do.")
         return 0
 
-    from mlx_lm import batch_generate
-
-    print(f"Loading {args.model} ...")
-    # Greedy decoding, so arms differ by prompt only
-    model, tok, sampler = load_model(args.model, args.adapter)
     suffix = " /no_think" if args.no_think else ""
 
-    def build_prompt(sentence: str):
-        content = ((user_turn(sentence) if user_turn else user_msg.format(s=sentence))
-                   + suffix)
-        return (template_prompt(tok, system, content) if chat
-                else encode_chat(tok, system, content))
+    def user_content(sentence: str) -> str:
+        return ((user_turn(sentence) if user_turn else user_msg.format(s=sentence))
+                + suffix)
+
+    if args.backend == "openai":
+        from grounding.parsing.openai_backend import OpenAIChat
+
+        chat_api = OpenAIChat(args.model, workers=args.workers)
+        print(f"Parsing with {args.model} via the OpenAI API (greedy)")
+
+        def generate(chunk):
+            results = chat_api.sample_many(
+                system, [user_content(r["sentence"]) for r in chunk],
+                seeds=[args.seed] * len(chunk), n=1, temperature=0.0,
+                max_tokens=args.max_tokens)
+            return [res.texts[0] for res in results]
+    else:
+        print(f"Loading {args.model} ...")
+        # Greedy decoding, so arms differ by prompt only
+        model, tok, sampler = load_model(args.model, args.adapter,
+                                         quantize=args.quantize,
+                                         device=args.device, dtype=args.dtype)
+
+        def build_prompt(sentence: str):
+            content = user_content(sentence)
+            return (template_prompt(tok, system, content) if chat
+                    else encode_chat(tok, system, content))
+
+        def generate(chunk):
+            return batch_generate(
+                model, tok, prompts=[build_prompt(r["sentence"]) for r in chunk],
+                max_tokens=args.max_tokens, sampler=sampler).texts
 
     n, n_fail = len(todo), 0
     dropped: Counter = Counter()   # predicates the engine has no encoder for
@@ -221,10 +274,7 @@ def main() -> int:
     with open(out_path, "a") as out:
         for start in range(0, n, args.batch_size):
             chunk = todo[start:start + args.batch_size]
-            resp = batch_generate(
-                model, tok, prompts=[build_prompt(r["sentence"]) for r in chunk],
-                max_tokens=args.max_tokens, sampler=sampler, verbose=False)
-            for r, raw in zip(chunk, resp.texts):
+            for r, raw in zip(chunk, generate(chunk)):
                 text = raw.split("<|im_end|>")[0]
                 # The legacy parser styles preserve their repairing behaviour
                 # The SFT-v4 path instead matches the supervised program
@@ -249,6 +299,9 @@ def main() -> int:
             rate = done / max(time.time() - t0, 1e-9)
             print(f"[{done}/{n}] failures {n_fail}  {rate * 60:.1f} rows/min  "
                   f"ETA {(n - done) / rate / 60:.0f}m", flush=True)
+
+    if args.backend == "hf":
+        free_memory()
 
     meta["written"] = {"rows": len(done_rows(out_path)), "failures_this_run": n_fail,
                        "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}

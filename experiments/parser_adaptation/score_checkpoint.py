@@ -17,7 +17,8 @@ from pathlib import Path
 
 
 from grounding.parsing import PROMPTS
-from grounding.parsing.generation import encode_chat, load_model
+from grounding.parsing.generation import (add_model_args, batch_generate,
+                                          encode_chat, free_memory, load_model)
 from grounding.parsing.training_set import user_turn
 from grounding.resolution.config import resolver_metadata
 from grounding.paths import CORPORA, REPO_ROOT, RESULTS_FINAL, RESULTS_STAGE3, ROLLOUTS
@@ -136,7 +137,10 @@ def main() -> int:
                          "runs; leave it at 0 for a real comparison")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    ap.add_argument("--adapter", default=None, help="LoRA adapter directory")
+    ap.add_argument("--adapter", default=None,
+                    help="PEFT LoRA adapter directory (train_lora.py output, or "
+                         "an MLX adapter converted with "
+                         "scripts/prepare/convert_mlx_adapter.py)")
     ap.add_argument("--representation", dest="representation",
                     default="extended",
                     help="which arm's resolver scores the programs: baseline | "
@@ -162,6 +166,7 @@ def main() -> int:
                          "model_tied) and its totals; model stays the "
                          "every-top-tie selection flag")
     ap.add_argument("--out", type=Path, default=None)
+    add_model_args(ap)
     args = ap.parse_args()
 
     engine.bind(args.representation)
@@ -194,10 +199,9 @@ def main() -> int:
             p["raw"] = raw[p["dataset_idx"]]
         print(f"  {len(picks)} generations read from {generated_by}; model not loaded")
     else:
-        from mlx_lm import batch_generate
-        import mlx.core as mx
-
-        model, tok, sampler = load_model(args.model, args.adapter)
+        model, tok, sampler = load_model(args.model, args.adapter,
+                                         quantize=args.quantize,
+                                         device=args.device, dtype=args.dtype)
         suffix = " /no_think" if args.no_think else ""
 
         system = PROMPTS[args.prompt]
@@ -210,7 +214,6 @@ def main() -> int:
 
         for i in range(0, len(picks), args.batch_size):
             chunk = picks[i:i + args.batch_size]
-            mx.clear_cache()
             resp = batch_generate(model, tok, prompts=[prompt(p["utterance"]) for p in chunk],
                                   max_tokens=args.max_tokens, sampler=sampler, verbose=False)
             for p, text in zip(chunk, resp.texts):
@@ -219,7 +222,7 @@ def main() -> int:
                 print(f"  generated {min(i + args.batch_size, len(picks))}/{len(picks)}  ({time.time() - t0:.0f}s)", flush=True)
 
         del model
-        mx.clear_cache()
+        free_memory()
 
     rule = {int(json.loads(l)["dataset_idx"]): json.loads(l).get("json_obj")
             for l in open(RULE_PARSES)} if args.split == "test" and RULE_PARSES.exists() else {}

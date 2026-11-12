@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Recompute parser validation loss over chosen token spans of saved adapters.
 
-Forward passes only: no optimizer, no weight update, nothing written except the
-optional --out file, which must not already exist. Token ids, padding and
-the loss follow mlx_lm 0.31.3 (`ChatDataset.process`, `iterate_batches`,
-`default_loss`). Four spans are reported, each a token-weighted mean
-cross-entropy over the tokens it contains:
+Forward passes only (PyTorch + PEFT): no optimizer, no weight update, nothing
+written except the optional --out file, which must not already exist. Token ids
+and batching follow train_lora.py (which mirrors mlx_lm 0.31.3's
+`ChatDataset.process` and `iterate_batches`). Three spans are reported, each a
+token-weighted mean cross-entropy over the tokens it contains:
 
-  mlx        exactly the `default_loss` mask with mask_prompt=false, i.e. what
-             `mlx_lm lora` logs as "Val loss": `steps <= lengths` also keeps
-             the target one past the last token, a padding id, per row
-  full       every real token after the first
+  full       every real token after the first; what train_lora.py logs as
+             "Val loss" (mlx_lm's logged loss also scored one padding target
+             per row, so old MLX logs sit slightly off this number)
   assistant  from the end of the `add_generation_prompt=True` prefix to the end
              (what `--mask-prompt` would train on: includes the empty think
              block the Qwen3 template writes into the final assistant turn)
@@ -21,9 +20,9 @@ Span offsets are lengths of the templated prefix and are checked to be a token
 prefix of the templated conversation; a row where they are not stops the run.
 
 --rows all scores every validation row. --rows logged scores the 25 batches
-`mlx_lm lora` drew for the "Val loss" line at --logged-iter, rebuilt from the
+train_lora.py drew for the "Val loss" line at --logged-iter, rebuilt from the
 run's seed. That line is computed before that iteration's update, so a saved
-NNNNNNN_adapters.safetensors is one update later than the logged value.
+NNNNNNN_adapters/ checkpoint is one update later than the logged value.
 Omitting --adapter scores the base model, which at iteration 1 is exactly
 the model that produced the first logged value (LoRA B starts at zero).
 """
@@ -41,19 +40,28 @@ import numpy as np
 from grounding.resolution.artifacts import sha256
 
 REPO = Path(__file__).resolve().parents[2]
-SPANS = ("mlx", "full", "assistant", "program")
-PAD_TO = 32  # mlx_lm.tuner.trainer.iterate_batches
+SPANS = ("full", "assistant", "program")
+#: Sequence positions per lm_head chunk when scoring
+LOSS_CHUNK = 256
 
 
 def load_run_config(args: argparse.Namespace) -> dict:
-    """Take run settings from the adapter's own adapter_config.json."""
+    """Take run settings from the adapter's training_config.json.
+
+    train_lora.py writes it; scripts/prepare/convert_mlx_adapter.py writes one
+    for converted MLX adapters from their old adapter_config.json.
+    """
     if args.adapter is None:
         if args.data is None:
             sys.exit("--data is required when no --adapter is given")
         return {"model": args.model, "data": str(args.data), "seed": args.seed,
                 "batch_size": 4, "max_seq_length": 2048, "val_batches": 25,
                 "steps_per_eval": 100, "iters": 1000, "mask_prompt": False}
-    config = json.loads((args.adapter / "adapter_config.json").read_text())
+    path = args.adapter / "training_config.json"
+    if not path.exists():
+        sys.exit(f"{path} is missing; was {args.adapter} written by train_lora.py "
+                 "or convert_mlx_adapter.py?")
+    config = json.loads(path.read_text())
     if args.data is not None:
         config["data"] = str(args.data)
     if args.seed is not None:
@@ -62,37 +70,43 @@ def load_run_config(args: argparse.Namespace) -> dict:
 
 
 def logged_iterations(steps_per_eval: int, iters: int) -> list[int]:
-    """Iterations at which mlx_lm.tuner.trainer.train runs evaluate()."""
+    """Iterations at which train_lora.py (like mlx_lm) runs evaluate()."""
     return [it for it in range(1, iters + 1)
             if it == 1 or it % steps_per_eval == 0 or it == iters]
 
 
 def logged_batches(config: dict, n_valid: int, iteration: int) -> list[int]:
-    """Replay the global numpy draws of `mlx_lm lora` up to that evaluation.
+    """Replay the global numpy draws of train_lora.py up to that evaluation.
 
-    run() seeds numpy with the run seed; the training iterator draws one
-    permutation of its batches before the first step, and every evaluate()
-    draws one permutation of the validation batches and keeps the first
-    val_batches. 1000 updates stay inside the first training epoch, so no
-    second training permutation interleaves.
+    numpy is seeded with the run seed; the training iterator draws one
+    permutation of its batches whenever an epoch starts (fetched before that
+    iteration's evaluation), and every evaluation draws one permutation of the
+    validation batches and keeps the first val_batches.
     """
     batch_size = config["batch_size"]
     train_path = REPO / config["data"] / "train.jsonl"
     with train_path.open() as f:
         n_train = sum(1 for _ in f)
     n_train_batches = n_train // batch_size
-    if config["iters"] > n_train_batches:
-        sys.exit("run spans more than one training epoch; the draw order "
-                 "is not replayed for that case")
     iterations = logged_iterations(config["steps_per_eval"], config["iters"])
     if iteration not in iterations:
         sys.exit(f"--logged-iter {iteration} is not an evaluated iteration: "
                  f"{iterations}")
     np.random.seed(config["seed"])
-    np.random.permutation(n_train_batches)
-    for _ in range(iterations.index(iteration) + 1):
-        drawn = np.random.permutation(n_valid // batch_size)
+    evaluated = set(iterations)
+    drawn = None
+    for it in range(1, iteration + 1):
+        if (it - 1) % n_train_batches == 0:
+            np.random.permutation(n_train_batches)
+        if it in evaluated:
+            drawn = np.random.permutation(n_valid // batch_size)
     return drawn[:config["val_batches"]].tolist()
+
+
+def _ids(out) -> list[int]:
+    if hasattr(out, "keys") and "input_ids" in out:
+        out = out["input_ids"]
+    return list(out)
 
 
 def encode(rows: list[dict], tokenizer) -> list[dict]:
@@ -101,12 +115,12 @@ def encode(rows: list[dict], tokenizer) -> list[dict]:
         messages = row["messages"]
         if messages[-1]["role"] != "assistant":
             sys.exit(f"valid row {index} does not end in an assistant turn")
-        tokens = tokenizer.apply_chat_template(messages, return_dict=False)
-        assistant = tokenizer.apply_chat_template(
-            messages[:-1], add_generation_prompt=True, return_dict=False)
-        program = tokenizer.apply_chat_template(
+        tokens = _ids(tokenizer.apply_chat_template(messages, tokenize=True))
+        assistant = _ids(tokenizer.apply_chat_template(
+            messages[:-1], add_generation_prompt=True, tokenize=True))
+        program = _ids(tokenizer.apply_chat_template(
             messages[:-1], add_generation_prompt=True, enable_thinking=False,
-            return_dict=False)
+            tokenize=True))
         for name, prefix in (("assistant", assistant), ("program", program)):
             if tokens[:len(prefix)] != prefix:
                 sys.exit(f"valid row {index}: the {name} prefix is not a token "
@@ -115,8 +129,6 @@ def encode(rows: list[dict], tokenizer) -> list[dict]:
         if end <= len(program):
             sys.exit(f"valid row {index}: no {tokenizer.eos_token!r} after the program")
         encoded.append({"tokens": tokens, "spans": {
-            # len(tokens) is padding; batches pad past the longest row, so that position exists
-            "mlx": (1, len(tokens) + 1),
             "full": (1, len(tokens)),
             "assistant": (len(assistant), len(tokens)),
             "program": (len(program), end),
@@ -125,7 +137,7 @@ def encode(rows: list[dict], tokenizer) -> list[dict]:
 
 
 def batches(n_rows: int, batch_size: int, mode: str, drawn: list[int] | None):
-    # iterate_batches sorts by raw JSON key count, not token count; equal counts keep file order
+    # Batches group rows by raw JSON key count, not token count; equal counts keep file order
     order = list(range(n_rows))
     groups = [order[i:i + batch_size]
               for i in range(0, n_rows - batch_size + 1, batch_size)]
@@ -135,10 +147,14 @@ def batches(n_rows: int, batch_size: int, mode: str, drawn: list[int] | None):
     return groups + ([order[covered:]] if covered < n_rows else [])
 
 
-def score(model, encoded: list[dict], groups, max_seq_length: int) -> dict:
-    import mlx.core as mx
-    import mlx.nn as nn
+def score(model, encoded: list[dict], groups, max_seq_length: int,
+          pad_id: int) -> dict:
+    import torch
+    import torch.nn.functional as F
 
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    head = base.get_output_embeddings()
+    device = head.weight.device
     totals = {span: 0.0 for span in SPANS}
     counts = {span: 0 for span in SPANS}
     for group in groups:
@@ -147,27 +163,33 @@ def score(model, encoded: list[dict], groups, max_seq_length: int) -> dict:
         if longest > max_seq_length:
             sys.exit(f"a row has {longest} tokens > max_seq_length "
                      f"{max_seq_length}; truncation is not replayed")
-        width = min(1 + PAD_TO * ((longest + PAD_TO - 1) // PAD_TO), max_seq_length)
-        batch = np.zeros((len(rows), width), np.int32)
+        batch = torch.full((len(rows), longest), pad_id, dtype=torch.long)
+        attn = torch.zeros((len(rows), longest), dtype=torch.long)
         for j, row in enumerate(rows):
-            batch[j, :len(row["tokens"])] = row["tokens"]
-        batch = mx.array(batch)
-        logits = model(batch[:, :-1])
-        # Same dtype path as default_loss: loss in model dtype, summed in float32
-        ce = nn.losses.cross_entropy(logits, batch[:, 1:]).astype(mx.float32)
-        # Position t predicts token t + 1, so tokens [start, end) are scored at [start - 1, end - 1)
-        positions = mx.arange(ce.shape[1])
-        sums = {}
+            batch[j, :len(row["tokens"])] = torch.tensor(row["tokens"])
+            attn[j, :len(row["tokens"])] = 1
+        batch, attn = batch.to(device), attn.to(device)
+        with torch.no_grad():
+            hidden = base.model(input_ids=batch, attention_mask=attn).last_hidden_state
+            # Position t predicts token t + 1; ce[:, t] scores token t + 1, in float32
+            parts = []
+            for s0 in range(0, longest - 1, LOSS_CHUNK):
+                logits = head(hidden[:, s0:min(s0 + LOSS_CHUNK, longest - 1)]).float()
+                tgt = batch[:, s0 + 1:s0 + 1 + logits.shape[1]]
+                parts.append(F.cross_entropy(logits.transpose(1, 2), tgt,
+                                             reduction="none"))
+            ce = torch.cat(parts, dim=1)
+        positions = torch.arange(ce.shape[1], device=device)
         for span in SPANS:
-            starts = mx.array([row["spans"][span][0] - 1 for row in rows])[:, None]
-            ends = mx.array([row["spans"][span][1] - 1 for row in rows])[:, None]
+            # Tokens [start, end) are scored at positions [start - 1, end - 1)
+            starts = torch.tensor([row["spans"][span][0] - 1 for row in rows],
+                                  device=device)[:, None]
+            ends = torch.tensor([row["spans"][span][1] - 1 for row in rows],
+                                device=device)[:, None]
             mask = (positions >= starts) & (positions < ends)
-            sums[span] = (ce * mask).sum()
+            totals[span] += (ce * mask).sum().item()
             counts[span] += sum(row["spans"][span][1] - row["spans"][span][0]
                                 for row in rows)
-        mx.eval(sums)
-        for span in SPANS:
-            totals[span] += sums[span].item()
     return {span: {"loss": totals[span] / counts[span],
                    "perplexity": math.exp(totals[span] / counts[span]),
                    "tokens": counts[span]} for span in SPANS}
@@ -180,9 +202,9 @@ def main() -> int:
                     help="adapter directory (reads its adapter_config.json); "
                          "omit to score the base model")
     ap.add_argument("--weights", type=Path,
-                    help="checkpoint file to score with --adapter's config, e.g. "
-                         "an archived 0000400_adapters.safetensors (default: "
-                         "the adapter's adapters.safetensors)")
+                    help="checkpoint directory to score with --adapter's config, "
+                         "e.g. <adapter>/0000400_adapters (default: the final "
+                         "adapter in --adapter)")
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B",
                     help="base model when no --adapter is given")
     ap.add_argument("--data", type=Path,
@@ -193,6 +215,8 @@ def main() -> int:
     ap.add_argument("--rows", choices=("all", "logged"), default="all")
     ap.add_argument("--logged-iter", type=int, default=1000)
     ap.add_argument("--out", type=Path, help="write the report here; must not exist")
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--dtype", default="auto")
     args = ap.parse_args()
 
     if args.out is not None and args.out.exists():
@@ -206,39 +230,38 @@ def main() -> int:
     valid_path = REPO / config["data"] / "valid.jsonl"
     rows = [json.loads(line) for line in valid_path.open() if line.strip()]
     if len({len(row) for row in rows}) != 1:
-        sys.exit("valid rows have differing key counts; mlx_lm's batch order "
-                 "is not file order and is not replayed here")
+        sys.exit("valid rows have differing key counts; the trainer's batch "
+                 "order is not file order and is not replayed here")
 
-    import mlx.core as mx
-    from mlx.utils import tree_flatten
-    from mlx_lm import load
-    from mlx_lm.tuner.utils import load_adapters
-    model, tokenizer = load(config["model"])
+    from grounding.parsing.generation import load_model
+
     weights = None
     if args.adapter is not None:
-        weights = args.weights or args.adapter / "adapters.safetensors"
-        # load_adapters loads non-strictly, so the chosen file is checked key- and shape-wise first
-        model = load_adapters(model, str(args.adapter))
-        lora = {k: v for k, v in tree_flatten(model.parameters()) if "lora_" in k}
-        saved = mx.load(str(weights))
-        if (saved.keys() != lora.keys()
-                or any(saved[k].shape != lora[k].shape for k in lora)):
-            sys.exit(f"{weights} does not match the LoRA layers of {args.adapter}")
-        model.load_weights(list(saved.items()), strict=False)
-    model.eval()
+        weights = args.weights or args.adapter
+        if not (weights / "adapter_config.json").exists():
+            sys.exit(f"{weights} is not a PEFT adapter directory")
+    model, tokenizer, _ = load_model(config["model"],
+                                     None if weights is None else str(weights),
+                                     device=args.device, dtype=args.dtype)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     encoded = encode(rows, tokenizer)
     drawn = (logged_batches(config, len(rows), args.logged_iter)
              if args.rows == "logged" else None)
     groups = batches(len(rows), config["batch_size"], args.rows, drawn)
-    metrics = score(model, encoded, groups, config["max_seq_length"])
+    metrics = score(model, encoded, groups, config["max_seq_length"],
+                    tokenizer.pad_token_id)
 
     report = {
         "model": config["model"],
         "adapter": None if args.adapter is None else str(args.adapter),
         "weights": None if weights is None else str(weights),
-        "weights_sha256": None if weights is None else sha256(weights),
-        "valid": str(valid_path.relative_to(REPO)),
+        "weights_sha256": None if weights is None else sha256(
+            next(p for p in (weights / "adapter_model.safetensors",
+                             weights / "adapter_model.bin") if p.exists())),
+        "valid": str(valid_path.relative_to(REPO)
+                     if valid_path.is_relative_to(REPO) else valid_path),
         "rows": args.rows,
         "logged_iter": args.logged_iter if args.rows == "logged" else None,
         "examples": sum(len(group) for group in groups),

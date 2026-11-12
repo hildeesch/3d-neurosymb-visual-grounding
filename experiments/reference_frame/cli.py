@@ -17,6 +17,7 @@ import argparse
 from pathlib import Path
 
 from experiments.reference_frame import ablation, frame_pass, rows, selection
+from grounding.parsing.generation import add_model_args
 from grounding.resolution.config import (CONTROL_FLAGS, add_resolver_flags,
                                          resolver_from_args, resolver_suffix)
 
@@ -66,7 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--model", required=True,
-                   help="local mlx-lm model path or Hugging Face model id")
+                   help="local model path or Hugging Face model id "
+                        "(loaded with transformers/PyTorch)")
     p.add_argument("--limit", type=int, default=None,
                    help="parse only the first N rows of the input, in file "
                         "order. This is a debugging convenience: the probe is "
@@ -76,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--print-changes", type=int, default=20)
     p.add_argument("--thinking", action="store_true",
                    help="enable Qwen3 thinking. Off by default: it truncates the JSON")
+    p.add_argument("--seed", type=int, default=0,
+                   help="sampling seed when --temperature > 0")
+    add_model_args(p)
 
     p = add_resolver_flags(stage("ablate"), CONTROL_FLAGS)
     p.add_argument("--rows", default=ablation.ABLATE_DEFAULT_ROWS,
