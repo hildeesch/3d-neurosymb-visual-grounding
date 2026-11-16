@@ -30,7 +30,7 @@ evaluation = [
 # for your CUDA version first if pip's default wheel does not match your driver:
 # https://pytorch.org/get-started/locally/
 training = [
-    "torch>=2.4",
+    "torch>=2.6",           # transformers 5.x disables torch < 2.6
     "transformers>=4.51",   # Qwen3 support
     "peft>=0.13",
     "accelerate>=1.0",

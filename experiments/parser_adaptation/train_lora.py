@@ -210,8 +210,9 @@ def build_model(cfg: dict, device: str, dtype: str):
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from grounding.parsing.generation import _dtype_for
+    from grounding.parsing.generation import _dtype_for, check_torch_for_transformers
 
+    check_torch_for_transformers()
     torch_dtype = _dtype_for(device, dtype)
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"])
     if tokenizer.pad_token_id is None:

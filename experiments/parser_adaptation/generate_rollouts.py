@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Generate parse rollouts for Nr3D training utterances.
 
-Two teacher backends write the same row format, so filter_rollouts.py and the
-training-set builders consume either one unchanged:
+Three teacher backends write the same row format, so filter_rollouts.py and
+the training-set builders consume any of them unchanged:
 
-  hf      a local Hugging Face model through PyTorch (default: Qwen3-30B-A3B)
-  openai  an OpenAI chat model (default: gpt-4o-2024-08-06), n samples per call
+  hf        a local Hugging Face model through PyTorch (default: Qwen3-30B-A3B)
+  llamacpp  a GGUF model served by a running llama.cpp ``llama-server``; fits
+            Qwen3-30B-A3B on a 16 GB GPU by keeping some experts in system RAM
+  openai    an OpenAI chat model (default: gpt-4o-2024-08-06), n samples per call
 
 Every output gets ``<output>.meta.json`` recording backend, model, prompt hash,
 decoding and seed. Resuming into a file written under different settings is
@@ -28,6 +30,7 @@ from grounding.parsing import PROMPTS, extract_json_objects
 from grounding.parsing.generation import (add_model_args, batch_generate,
                                           batch_seed, load_model,
                                           template_prompt)
+from grounding.parsing.llamacpp_backend import add_llamacpp_args
 from grounding.parsing.openai_backend import DEFAULT_OPENAI_MODEL
 
 DEFAULT_HF_MODEL = "Qwen/Qwen3-30B-A3B"
@@ -95,6 +98,11 @@ def invocation(args, system: str) -> dict:
     if args.backend == "hf":
         meta["decoding"].update(batch_size=args.batch_size, quantize=args.quantize,
                                 dtype=args.dtype)
+    if args.backend == "llamacpp":
+        meta["decoding"].update(template_tokenizer=args.tokenizer,
+                                min_p=0.0, penalties="off")
+        # Recorded, not compared on resume: where and how the GGUF was served
+        meta["server"] = getattr(args, "server_info", {})
     return meta
 
 
@@ -124,11 +132,14 @@ def row_record(row: dict, raw_samples: list[str], extra: dict | None = None) -> 
     return rec
 
 
-def run_hf(args, rows, system, fout, stats) -> None:
-    print(f"Loading {args.model} ...")
-    model, tokenizer, sampler = load_model(
-        args.model, temperature=args.temp, seed=args.seed,
-        quantize=args.quantize, device=args.device, dtype=args.dtype)
+def load_hf(args):
+    print(f"Loading {args.model} ...", flush=True)
+    return load_model(args.model, temperature=args.temp, seed=args.seed,
+                      quantize=args.quantize, device=args.device, dtype=args.dtype)
+
+
+def run_hf(args, rows, system, fout, stats, loaded) -> None:
+    model, tokenizer, sampler = loaded
 
     prompts = [template_prompt(tokenizer, system, user_message(row["utterance"]))
                for row in rows]
@@ -157,7 +168,55 @@ def run_hf(args, rows, system, fout, stats) -> None:
         stats.report(min(start + len(group), len(rows)), len(rows))
 
 
-def run_openai(args, rows, system, fout, stats) -> None:
+def connect_llamacpp(args):
+    from grounding.parsing.llamacpp_backend import LlamaCppServer
+
+    server = LlamaCppServer(args.server_url, workers=args.workers)
+    print(f"Connecting to llama-server at {args.server_url} ...", flush=True)
+    props = server.wait_ready()
+    gguf = server.model_name(props)
+    args.model = args.model or gguf
+    args.server_info = {"url": args.server_url, "gguf": gguf,
+                        "total_slots": props.get("total_slots"),
+                        "build_info": props.get("build_info")}
+    slots = props.get("total_slots")
+    if slots and args.workers > slots:
+        print(f"  note: {args.workers} workers but the server has {slots} slots; "
+              "extra requests queue", flush=True)
+    print(f"  serving {gguf} ({slots} slots)", flush=True)
+    return server
+
+
+def run_llamacpp(args, rows, system, fout, stats, server) -> None:
+    from grounding.parsing.llamacpp_backend import load_template_tokenizer
+
+    tokenizer = load_template_tokenizer(args.tokenizer)
+    # Same rendered prompt as the hf (and former MLX) path: template, thinking off
+    prompts = [template_prompt(tokenizer, system, user_message(row["utterance"]),
+                               tokenize=False) for row in rows]
+
+    # Enough rows per chunk to keep every worker (server slot) busy
+    rows_per_chunk = max(1, -(-args.workers // args.n_samples))
+
+    for start in range(0, len(rows), rows_per_chunk):
+        group = rows[start:start + rows_per_chunk]
+        jobs = [(prompts[start + i], batch_seed(args.seed, f"{row['row_idx']}:{k}"))
+                for i, row in enumerate(group) for k in range(args.n_samples)]
+        done = server.complete_many(jobs, max_tokens=args.max_tokens,
+                                    temperature=args.temp)
+
+        for i, row in enumerate(group):
+            outs = done[i * args.n_samples:(i + 1) * args.n_samples]
+            rec = row_record(row, [o.text for o in outs],
+                             {"stop_types": [o.stop_type for o in outs]})
+            stats.add(rec, sum(o.tokens for o in outs))
+            fout.write(json.dumps(rec) + "\n")
+
+        fout.flush()
+        stats.report(min(start + len(group), len(rows)), len(rows))
+
+
+def run_openai(args, rows, system, fout, stats, loaded=None) -> None:
     from grounding.parsing.openai_backend import OpenAIChat
 
     chat = OpenAIChat(args.model, workers=args.workers)
@@ -216,11 +275,13 @@ def main() -> int:
                         help="default: data/rollouts/nr3d_rollouts_<prompt>"
                              "[_<openai model>].jsonl")
     parser.add_argument("--prompt", choices=sorted(PROMPTS), default="v3")
-    parser.add_argument("--backend", choices=["hf", "openai"], default="hf",
-                        help="hf: local PyTorch model; openai: OpenAI chat API")
+    parser.add_argument("--backend", choices=["hf", "llamacpp", "openai"],
+                        default="hf",
+                        help="hf: local PyTorch model; llamacpp: running "
+                             "llama-server (GGUF); openai: OpenAI chat API")
     parser.add_argument("--model", default=None,
-                        help=f"default: {DEFAULT_HF_MODEL} (hf) or "
-                             f"{DEFAULT_OPENAI_MODEL} (openai)")
+                        help=f"default: {DEFAULT_HF_MODEL} (hf), the served GGUF "
+                             f"file name (llamacpp) or {DEFAULT_OPENAI_MODEL} (openai)")
     parser.add_argument("--limit", type=int, default=2800,
                         help="Number of utterances to process; 0 uses all rows.")
     parser.add_argument("--n-samples", type=int, default=8)
@@ -231,16 +292,23 @@ def main() -> int:
                              "seeded from it, so resumed runs stay on one stream")
     parser.add_argument("--batch-size", type=int, default=8,
                         help="hf: maximum number of generated sequences per batch.")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="openai: concurrent requests")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="concurrent requests: openai (default 4) or "
+                             "llamacpp (default 8; match llama-server -np)")
     add_model_args(parser)
+    add_llamacpp_args(parser)
 
     args = parser.parse_args()
+    args.workers = args.workers or (8 if args.backend == "llamacpp" else 4)
+
+    # Connect before anything is written, so a missing server leaves no file
+    server = connect_llamacpp(args) if args.backend == "llamacpp" else None
     args.model = args.model or (DEFAULT_OPENAI_MODEL if args.backend == "openai"
                                 else DEFAULT_HF_MODEL)
 
     if args.output is None:
-        tag = f"_{args.model.replace('/', '_')}" if args.backend == "openai" else ""
+        tag = ("" if args.backend == "hf"
+               else "_" + Path(args.model.replace("/", "_")).stem)
         args.output = Path(f"data/rollouts/nr3d_rollouts_{args.prompt}{tag}.jsonl")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -260,10 +328,12 @@ def main() -> int:
         print("Nothing to do.")
         return 0
 
+    # Load before opening the output, so a failed load leaves no empty file
+    loaded = load_hf(args) if args.backend == "hf" else server
+    runner = {"hf": run_hf, "llamacpp": run_llamacpp, "openai": run_openai}[args.backend]
     stats = Stats()
     with args.output.open("a") as fout:
-        (run_openai if args.backend == "openai" else run_hf)(
-            args, rows, system, fout, stats)
+        runner(args, rows, system, fout, stats, loaded)
 
     print(f"Done. {len(rows)} prompts x {args.n_samples} = {stats.samples} samples "
           f"({stats.valid} parsed). {stats.rate():.1f} tok/s. Wrote {args.output}")

@@ -34,11 +34,62 @@ versions are not a validated lock.
 | --- | --- | --- |
 | Student parsing / scoring | Qwen3-1.7B (+ LoRA) | ~4 GB GPU (bf16), or CPU |
 | Student LoRA training | Qwen3-1.7B, batch 4, `--grad-checkpoint` | ~6–8 GB GPU |
-| Teacher rollouts | Qwen3-30B-A3B, `--quantize 4bit` | ~18 GB GPU; with less, layers spill to CPU RAM (slow) |
+| Teacher rollouts | Qwen3-30B-A3B, `--quantize 4bit` | ~18 GB GPU; does not load on a 16 GB GPU |
+| Teacher rollouts | Qwen3-30B-A3B GGUF via `--backend llamacpp` | 16 GB GPU + ~16 GB free RAM (see below) |
 | Teacher rollouts | `--backend openai` (GPT-4o) | none locally; needs `OPENAI_API_KEY` |
 
 Check your GPU with `nvidia-smi`. All generators take `--device`, `--dtype`
-and `--quantize`.
+and `--quantize`. With the default `--device auto`, scripts stop when no GPU
+is usable instead of silently running on CPU; pass `--device cpu` to run on
+CPU on purpose. If PyTorch warns that the NVIDIA driver is too old, install a
+torch build for your driver's CUDA version (shown top right in `nvidia-smi`),
+e.g. `pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124`
+for a CUDA 12.2 driver (cu118 if that still fails). Transformers 5.x needs
+torch >= 2.6.
+
+### Teacher on a 16 GB GPU: llama.cpp
+
+Qwen3-30B-A3B at 4 bits (~18 GB) does not fit a 16 GB GPU through
+Transformers. llama.cpp can run it there: `--n-cpu-moe N` keeps the expert
+weights of N layers in system RAM, and because only ~3B parameters are active
+per token this stays reasonably fast. (On Apple Silicon the original MLX run
+fitted because GPU and CPU share one memory pool.)
+
+1. **Get `llama-server`.** Either download a prebuilt Linux Vulkan release from
+   https://github.com/ggml-org/llama.cpp/releases (no CUDA toolkit needed), or
+   build with CUDA (needs a CUDA toolkit your driver supports, e.g. 12.2):
+   ```bash
+   git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+   cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release -j
+   # binary: build/bin/llama-server
+   ```
+2. **Download the 4-bit GGUF** (~18.6 GB) into `models/` (git-ignored):
+   ```bash
+   hf download Qwen/Qwen3-30B-A3B-GGUF --include "*Q4_K_M*" --local-dir models/
+   ```
+3. **Start the server** in its own terminal. Raise `--n-cpu-moe` if it runs
+   out of GPU memory, lower it while `nvidia-smi` shows room (lower = faster):
+   ```bash
+   llama-server -m models/Qwen3-30B-A3B-Q4_K_M.gguf -ngl 99 --n-cpu-moe 16 \
+     -c 16384 -np 8 --port 8080
+   ```
+   `-np 8` serves 8 requests in parallel (one prompt's 8 samples); `-c` is
+   shared between them, so each gets 2048 tokens, enough for prompt + output.
+4. **Generate** (try `--limit 20` first to check speed and valid-JSON rate):
+   ```bash
+   python -m experiments.parser_adaptation.generate_rollouts --backend llamacpp \
+     --prompt v4 --limit 8750 --n-samples 8 --temp 0.7 \
+     --output data/rollouts/nr3d_rollouts_qwen.jsonl
+   ```
+
+The prompt is rendered with the Hugging Face tokenizer of `Qwen/Qwen3-30B-A3B`
+(only tokenizer files are downloaded; `--tokenizer` to change), thinking off,
+identically to the other backends, and sent as text to `/completion`. Sampling
+is pure temperature (llama.cpp's default top-k/top-p/min-p are switched off per
+request) and every sample has its own seed. `parse_split.py --backend llamacpp`
+does the same for greedy zero-shot parses. For the paper: this teacher is the
+Q4_K_M GGUF quantisation, not the MLX 4-bit one, so it is the same model at a
+comparable but not identical quantisation.
 
 ### Moving from the MLX version
 
@@ -113,7 +164,8 @@ python -m experiments.parser_adaptation.parse_split \
 
 ### Comparing teachers
 
-Teacher rollouts can come from the local Qwen model or from GPT-4o. Both write
+Teacher rollouts can come from the local Qwen model (Transformers or llama.cpp)
+or from GPT-4o. All write
 the same row format, so the rest of the pipeline is shared; give each teacher
 its own file names:
 

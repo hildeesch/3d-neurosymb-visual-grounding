@@ -96,6 +96,11 @@ def main() -> int:
     rn = rel_num()
 
     rows = [json.loads(l) for l in open(REPO_ROOT / args.rollouts) if l.strip()]
+    if not rows:
+        raise SystemExit(
+            f"{args.rollouts} has no rollout rows. generate_rollouts.py most "
+            "likely stopped before its first batch (check its output for a "
+            "model-loading or CUDA error) or is still running.")
     if args.limit:
         rows = rows[: args.limit]
     # Grouped by scan so each scene is built once and dropped once

@@ -7,6 +7,8 @@ the output before evaluation; existing rows are skipped unless ``--fresh`` is se
 an optional PEFT LoRA ``--adapter``. ``--backend openai`` sends the same system
 prompt and user turn to an OpenAI chat model (greedy, T=0) for the zero-shot
 ``teacher``/``fused`` styles, so an API parser can be compared on equal terms.
+``--backend llamacpp`` sends the identically rendered prompt to a running
+llama.cpp ``llama-server`` (a GGUF model such as Qwen3-30B-A3B), greedy.
 """
 from __future__ import annotations
 
@@ -28,6 +30,8 @@ from grounding.parsing import PROMPTS
 from grounding.parsing.generation import (add_model_args, batch_generate,
                                           encode_chat, free_memory, load_model,
                                           template_prompt)
+from grounding.parsing.generation import chat_text
+from grounding.parsing.llamacpp_backend import add_llamacpp_args
 from grounding.parsing.openai_backend import DEFAULT_OPENAI_MODEL
 from grounding.resolution.artifacts import git_commit, sha256
 
@@ -99,7 +103,9 @@ def invocation(args, rows_path: Path, version: str, system: str,
                      "max_tokens": args.max_tokens, "batch_size": args.batch_size,
                      "no_think": bool(args.no_think),
                      **({"quantize": args.quantize, "dtype": args.dtype}
-                        if args.backend == "hf" else {"seed": args.seed})},
+                        if args.backend == "hf" else
+                        {"template_tokenizer": args.tokenizer}
+                        if args.backend == "llamacpp" else {"seed": args.seed})},
     }
 
 
@@ -130,12 +136,13 @@ def main() -> int:
                     help="utterances to parse: the test csv, or a probe jsonl")
     # Defaults describe the zero-shot 1.7B student; the full system supplies --adapter explicitly
     ap.add_argument("--out", default="data/parses/test/nr3d_test_qwen3_1p7b_v4_ext.jsonl")
-    ap.add_argument("--backend", choices=["hf", "openai"], default="hf",
-                    help="hf: local PyTorch model; openai: OpenAI chat API "
+    ap.add_argument("--backend", choices=["hf", "llamacpp", "openai"], default="hf",
+                    help="hf: local PyTorch model; llamacpp: running llama-server "
+                         "(GGUF, no adapters); openai: OpenAI chat API "
                          "(teacher/fused styles only)")
     ap.add_argument("--model", default=None,
-                    help="default: Qwen/Qwen3-1.7B (hf) or "
-                         f"{DEFAULT_OPENAI_MODEL} (openai)")
+                    help="default: Qwen/Qwen3-1.7B (hf), the served GGUF file "
+                         f"name (llamacpp) or {DEFAULT_OPENAI_MODEL} (openai)")
     ap.add_argument("--adapter", default=None,
                     help="optional PEFT LoRA adapter directory (hf only); "
                          "convert old MLX adapters with "
@@ -157,9 +164,19 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0,
                     help="openai: request seed (best-effort determinism)")
     ap.add_argument("--workers", type=int, default=8,
-                    help="openai: concurrent requests")
+                    help="openai / llamacpp: concurrent requests (llamacpp: "
+                         "match llama-server -np)")
     add_model_args(ap)
+    add_llamacpp_args(ap)
     args = ap.parse_args()
+    server = None
+    if args.backend == "llamacpp":
+        if args.adapter:
+            ap.error("--adapter applies to --backend hf only")
+        from grounding.parsing.llamacpp_backend import LlamaCppServer
+
+        server = LlamaCppServer(args.server_url, workers=args.workers)
+        args.model = args.model or server.model_name(server.wait_ready())
     args.model = args.model or (DEFAULT_OPENAI_MODEL if args.backend == "openai"
                                 else "Qwen/Qwen3-1.7B")
     if args.backend == "openai":
@@ -250,6 +267,23 @@ def main() -> int:
                 seeds=[args.seed] * len(chunk), n=1, temperature=0.0,
                 max_tokens=args.max_tokens)
             return [res.texts[0] for res in results]
+    elif args.backend == "llamacpp":
+        from grounding.parsing.llamacpp_backend import load_template_tokenizer
+
+        tok = load_template_tokenizer(args.tokenizer)
+        print(f"Parsing with {args.model} via llama-server at {args.server_url} "
+              "(greedy)")
+
+        def build_text(sentence: str) -> str:
+            content = user_content(sentence)
+            return (template_prompt(tok, system, content, tokenize=False) if chat
+                    else chat_text(system, content))
+
+        def generate(chunk):
+            outs = server.complete_many([(build_text(r["sentence"]), None)
+                                         for r in chunk],
+                                        max_tokens=args.max_tokens, temperature=0.0)
+            return [o.text for o in outs]
     else:
         print(f"Loading {args.model} ...")
         # Greedy decoding, so arms differ by prompt only

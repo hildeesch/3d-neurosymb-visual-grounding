@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 __all__ = [
+    "chat_text",
     "encode_chat",
     "template_prompt",
     "load_model",
@@ -33,12 +34,16 @@ __all__ = [
 ]
 
 
+def chat_text(system: str, user: str) -> str:
+    """The Qwen chat layout as text, without the tokenizer's template."""
+    return (f"<|im_start|>system\n{system}<|im_end|>\n"
+            f"<|im_start|>user\n{user}<|im_end|>\n"
+            f"<|im_start|>assistant\n")
+
+
 def encode_chat(tokenizer, system: str, user: str) -> list[int]:
     """The Qwen chat layout, encoded directly rather than through a template."""
-    return tokenizer.encode(f"<|im_start|>system\n{system}<|im_end|>\n"
-                            f"<|im_start|>user\n{user}<|im_end|>\n"
-                            f"<|im_start|>assistant\n",
-                            add_special_tokens=False)
+    return tokenizer.encode(chat_text(system, user), add_special_tokens=False)
 
 
 def template_prompt(tokenizer, system: str, user: str, *, tokenize=True,
@@ -77,16 +82,40 @@ def _as_ids(out) -> list[int]:
 # Device, precision and loading
 
 def pick_device(device: str | None = None) -> str:
-    """``cuda`` when available, else ``mps`` (Apple), else ``cpu``."""
+    """``cuda`` when available, else ``mps`` (Apple); never a silent CPU fallback.
+
+    ``--device auto`` without a usable GPU stops with an explanation: falling
+    back to CPU quietly turns a 30B model into a ~120 GB float32 load. Pass
+    ``--device cpu`` to run on CPU on purpose.
+    """
+    import shutil
+
     import torch
 
     if device and device != "auto":
+        if device == "cuda" and not torch.cuda.is_available():
+            raise SystemExit(_no_cuda_message(torch, shutil))
         return device
     if torch.cuda.is_available():
         return "cuda"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
-    return "cpu"
+    raise SystemExit(_no_cuda_message(torch, shutil)
+                     + "\nTo run on CPU on purpose, pass --device cpu.")
+
+
+def _no_cuda_message(torch, shutil) -> str:
+    msg = (f"No usable GPU: torch {torch.__version__} (built for CUDA "
+           f"{torch.version.cuda or 'none'}) cannot use CUDA here.")
+    if torch.version.cuda and shutil.which("nvidia-smi"):
+        msg += ("\nAn NVIDIA driver is installed, so this is most likely a "
+                "driver/PyTorch mismatch: the driver's CUDA version (top right "
+                "of `nvidia-smi`) must be >= the CUDA version torch was built "
+                "for. Install a matching build, e.g.\n  pip install torch "
+                "--index-url https://download.pytorch.org/whl/cu121")
+    elif not torch.version.cuda:
+        msg += "\nThis torch build has no CUDA support (CPU-only wheel)."
+    return msg
 
 
 def _dtype_for(device: str, dtype: str | None):
@@ -133,6 +162,7 @@ def load_model(model: str, adapter: str | None = None, temperature: float = 0.0,
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    check_torch_for_transformers()
     dev = pick_device(device)
     torch_dtype = _dtype_for(dev, dtype)
     kwargs: dict = {"dtype": torch_dtype, "low_cpu_mem_usage": True}
@@ -169,6 +199,24 @@ def load_model(model: str, adapter: str | None = None, temperature: float = 0.0,
         loaded = PeftModel.from_pretrained(loaded, adapter)
     loaded.eval()
     return loaded, tokenizer, Sampler(temperature=temperature, seed=seed)
+
+
+def check_torch_for_transformers() -> None:
+    """Stop early when transformers has switched its PyTorch support off.
+
+    transformers 5.x silently disables torch older than 2.6, which surfaces
+    later as an unrelated-looking ``NameError: torch`` deep in its code.
+    """
+    import torch
+    from transformers.utils import is_torch_available
+
+    if not is_torch_available():
+        import transformers
+        raise SystemExit(
+            f"transformers {transformers.__version__} does not accept torch "
+            f"{torch.__version__} (it needs a newer torch, >= 2.6 for "
+            "transformers 5.x). Install a newer CUDA build, e.g.\n  pip install "
+            "torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124")
 
 
 def add_model_args(ap, *, quantize_default: str = "none") -> None:
