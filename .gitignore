@@ -6,7 +6,6 @@
 /models/
 /scenes/
 /results/
-/tests/
 
 # Baseline compatibility data links
 /baselines/lasp/data
@@ -26,6 +25,7 @@ wandb/
 # Historical and local output
 /archive/
 /logs/
+Claude outputs
 
 # Python
 __pycache__/

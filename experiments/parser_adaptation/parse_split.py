@@ -9,6 +9,15 @@ prompt and user turn to an OpenAI chat model (greedy, T=0) for the zero-shot
 ``teacher``/``fused`` styles, so an API parser can be compared on equal terms.
 ``--backend llamacpp`` sends the identically rendered prompt to a running
 llama.cpp ``llama-server`` (a GGUF model such as Qwen3-30B-A3B), greedy.
+
+``--teacher qwen|gpt4o`` is the semantic-parsing ablation: the untrained
+teacher parses the test rows in place of the LoRA student. It selects the
+``rollout`` style -- the v4 system prompt and the same user turn the teacher
+saw when it generated the distillation rollouts (chat template, thinking off) --
+greedy decoding, and the student's non-repairing clean/lower step, so the
+ablation changes the model and nothing else. ``qwen`` defaults to the
+llama.cpp backend (the 16 GB route; pass ``--backend hf`` for Transformers),
+``gpt4o`` to the OpenAI API.
 """
 from __future__ import annotations
 
@@ -44,7 +53,59 @@ STYLES = {
     "fused":   ("v2", False, "Parse: '{s}'", True),
     "teacher": ("v3", True,  'Input: "{s}"\nOutput:', True),
     "sft":     ("v4", False, None, False),
+    # The teacher's rollout conditioning (generate_rollouts.user_message is the
+    # same string as sft_user_turn), rendered with the chat template as the
+    # rollouts were, and lowered without recovery exactly like the student.
+    "rollout": ("v4", True, None, False),
 }
+
+#: Styles whose user turn is the shared v4 SFT/rollout turn, and whose system
+#: prompt is therefore fixed to v4.
+V4_TURN_STYLES = ("sft", "rollout")
+
+#: --teacher presets for the semantic-parsing ablation. backend: default
+#: backend; backends: the ones that serve this teacher; model: default model per
+#: backend (None = the served GGUF's own name); max_tokens: the rollouts' budget.
+TEACHERS = {
+    "qwen": {"backend": "llamacpp", "backends": ("llamacpp", "hf"),
+             "model": {"hf": "Qwen/Qwen3-30B-A3B", "llamacpp": None},
+             "max_tokens": 320},
+    "gpt4o": {"backend": "openai", "backends": ("openai",),
+              "model": {"openai": DEFAULT_OPENAI_MODEL},
+              "max_tokens": 320},
+}
+
+
+def teacher_out(teacher: str, rows_path: Path) -> str:
+    """Default output for a teacher parse of ``rows_path``."""
+    stem = rows_path.stem          # nr3d_test, nr3d_dev, ...
+    split = "dev" if "dev" in stem else "test"
+    return f"data/parses/{split}/{stem}_teacher_{teacher}_v4_ext.jsonl"
+
+
+def apply_teacher(args, ap) -> None:
+    """Fill the --teacher preset into flags the user left unset."""
+    if args.teacher is None:
+        for name, default in (("style", "sft"), ("backend", "hf"),
+                              ("max_tokens", 256)):
+            if getattr(args, name) is None:
+                setattr(args, name, default)
+        return
+    preset = TEACHERS[args.teacher]
+    if args.adapter:
+        ap.error("--teacher is the untrained teacher; it takes no --adapter")
+    if args.style not in (None, "rollout"):
+        ap.error(f"--teacher uses --style rollout, not {args.style!r}: any "
+                 "other style changes the prompt as well as the model")
+    args.style = "rollout"
+    args.backend = args.backend or preset["backend"]
+    if args.backend not in preset["backends"]:
+        ap.error(f"--teacher {args.teacher} runs on {'/'.join(preset['backends'])}, "
+                 f"not --backend {args.backend}")
+    if args.model is None:
+        args.model = preset["model"].get(args.backend)
+    if args.max_tokens is None:
+        args.max_tokens = preset["max_tokens"]
 
 
 def load_rows(path: Path, limit: int = 0) -> tuple[list[dict], bool]:
@@ -96,6 +157,7 @@ def invocation(args, rows_path: Path, version: str, system: str,
                  "sha256": sha256(rows_path), "n": n_rows, "limit": args.limit},
         "backend": args.backend,
         "model": args.model, "adapter": args.adapter,
+        "teacher": args.teacher,
         "representation": representation,
         "style": args.style, "prompt": version,
         "prompt_sha256": hashlib.sha256(system.encode()).hexdigest(),
@@ -135,11 +197,19 @@ def main() -> int:
     ap.add_argument("--rows", default="data/corpora/nr3d_test.csv",
                     help="utterances to parse: the test csv, or a probe jsonl")
     # Defaults describe the zero-shot 1.7B student; the full system supplies --adapter explicitly
-    ap.add_argument("--out", default="data/parses/test/nr3d_test_qwen3_1p7b_v4_ext.jsonl")
-    ap.add_argument("--backend", choices=["hf", "llamacpp", "openai"], default="hf",
-                    help="hf: local PyTorch model; llamacpp: running llama-server "
+    ap.add_argument("--out", default=None,
+                    help="default: data/parses/test/nr3d_test_qwen3_1p7b_v4_ext.jsonl, "
+                         "or data/parses/<split>/<rows>_teacher_<name>_v4_ext.jsonl "
+                         "with --teacher")
+    ap.add_argument("--teacher", choices=sorted(TEACHERS), default=None,
+                    help="semantic-parsing ablation: parse with the untrained "
+                         "teacher (qwen = Qwen3-30B-A3B, gpt4o = GPT-4o) under "
+                         "the rollout prompt; see the module docstring")
+    ap.add_argument("--backend", choices=["hf", "llamacpp", "openai"], default=None,
+                    help="default: hf, or the --teacher preset's backend. "
+                         "hf: local PyTorch model; llamacpp: running llama-server "
                          "(GGUF, no adapters); openai: OpenAI chat API "
-                         "(teacher/fused styles only)")
+                         "(teacher/fused/rollout styles only)")
     ap.add_argument("--model", default=None,
                     help="default: Qwen/Qwen3-1.7B (hf), the served GGUF file "
                          f"name (llamacpp) or {DEFAULT_OPENAI_MODEL} (openai)")
@@ -147,14 +217,16 @@ def main() -> int:
                     help="optional PEFT LoRA adapter directory (hf only); "
                          "convert old MLX adapters with "
                          "scripts/prepare/convert_mlx_adapter.py")
-    ap.add_argument("--style", default="sft", choices=sorted(STYLES),
-                    help="prompt formatting recipe; see the module docstring")
+    ap.add_argument("--style", default=None, choices=sorted(STYLES),
+                    help="prompt formatting recipe (default: sft, or rollout "
+                         "with --teacher); see the module docstring")
     ap.add_argument("--prompt", default=None, choices=sorted(PROMPTS),
                     help="prompt version; default is the style's")
     # A MoE model reads more expert weights per step, so batch trades sparsity for memory
     ap.add_argument("--batch-size", type=int, default=8,
                     help="prompts per batch_generate call")
-    ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="default: 256, or the rollouts' 320 with --teacher")
     ap.add_argument("--limit", type=int, default=0, help="0 = all")
     ap.add_argument("--fresh", action="store_true",
                     help="overwrite --out instead of resuming into it")
@@ -169,6 +241,7 @@ def main() -> int:
     add_model_args(ap)
     add_llamacpp_args(ap)
     args = ap.parse_args()
+    apply_teacher(args, ap)
     server = None
     if args.backend == "llamacpp":
         if args.adapter:
@@ -181,24 +254,28 @@ def main() -> int:
                                 else "Qwen/Qwen3-1.7B")
     if args.backend == "openai":
         if args.style == "sft":
-            ap.error("--backend openai needs --style teacher or fused; the sft "
-                     "style is the fine-tuned local student's format")
+            ap.error("--backend openai needs --style teacher, fused or rollout; "
+                     "the sft style is the fine-tuned local student's format")
         if args.adapter or args.no_think:
             ap.error("--adapter and --no-think apply to --backend hf only")
 
     rows_path = Path(args.rows)
     rows_path = rows_path if rows_path.is_absolute() else REPO_ROOT / rows_path
+    if args.out is None:
+        args.out = (teacher_out(args.teacher, rows_path) if args.teacher else
+                    "data/parses/test/nr3d_test_qwen3_1p7b_v4_ext.jsonl")
     if rows_path.suffix == ".csv":
         assert "train" not in rows_path.name.lower(), (
             f"rows look like a train split: {args.rows!r}")
 
     version, chat, user_msg, recover = STYLES[args.style]
-    if args.style == "sft" and args.prompt not in (None, "v4"):
-        ap.error("--style sft always uses the v4 SFT system prompt")
+    if args.style in V4_TURN_STYLES and args.prompt not in (None, "v4"):
+        ap.error(f"--style {args.style} always uses the v4 system prompt")
     version = args.prompt or version
     system = PROMPTS[version]
     # sft_user_turn is the shared implementation behind training_set.user_turn
-    user_turn = sft_user_turn if args.style == "sft" else None
+    # and generate_rollouts.user_message
+    user_turn = sft_user_turn if args.style in V4_TURN_STYLES else None
     representation = normalise_representation(args.representation)
     rel_num = load_rel_num(representation)
 

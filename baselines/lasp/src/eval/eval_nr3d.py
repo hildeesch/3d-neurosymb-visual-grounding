@@ -145,6 +145,30 @@ def parse(scan_id, json_obj, all_concepts, valid_ids):
     return final_concept
 
 
+def thesis_parse(norm_mode):
+    """The thesis resolver over LaSP's own vocabulary and feature tensors.
+
+    Opt-in (``--executor thesis``) for the representation ablation: the scene
+    representation is LaSP's (its encoders, its predicate table, no colour
+    keys, no ordinal rank), the executor is the extended tree's. Rank is
+    switched off because ordinal scoring is one of the representation additions;
+    colour drops out because LaSP's feature tensors carry no ``color:`` keys and
+    the resolver skips a colour it has no feature for. With
+    ``norm_mode="softmax"`` this reproduces ``parse`` above exactly
+    (tests/test_executor_equivalence.py).
+    """
+    from grounding.resolution.config import DEFAULT_RESOLVER
+    from grounding.resolution.resolver import parse as resolver_parse
+
+    config = DEFAULT_RESOLVER.updated(norm_mode=norm_mode, use_rank=False)
+
+    def scorer(scan_id, json_obj, all_concepts, valid_ids):
+        return resolver_parse(scan_id, json_obj, all_concepts, valid_ids,
+                              rel_num=rel_num, valid_relations=ALL_VALID_RELATIONS,
+                              config=config)
+    return scorer, config
+
+
 def query_vlm(scan_id, caption, filtered_candidates):
     image_root = Path('data/frames')
     masks_path = Path("data/nr3d_masks") / scan_id
@@ -248,6 +272,10 @@ def eval_nr3d(args):
     _SPLIT = getattr(args, "split", "test")
     dataset = Nr3DDataset(split=_SPLIT, label_type=args.label_type,
                           load_points=False)
+    scorer = parse
+    if getattr(args, "executor", "lasp") == "thesis":
+        scorer, config = thesis_parse(args.norm_mode)
+        print(f"executor: thesis resolver on LaSP features ({config})")
     all_features = torch.load(args.features_path, map_location=DEVICE, weights_only=False)
     
     totals_mode = args.totals
@@ -296,7 +324,7 @@ def eval_nr3d(args):
             valid_ids = torch.arange(len(all_locations), device=DEVICE)
             
             try:
-                final_concept = parse(scan_id, json_obj, features_this_scene, valid_ids)            
+                final_concept = scorer(scan_id, json_obj, features_this_scene, valid_ids)
             except (NotImplementedError, ValueError, RuntimeError):
                 skipped += 1
                 continue
@@ -375,6 +403,14 @@ if __name__ == "__main__":
     parser.add_argument("--dump", type=str, default=None, help="Write per-utterance outcomes to file.")
     parser.add_argument("--totals", choices=["official", "parses"], default="official", help="Denominator mode.")
     parser.add_argument("--tie_break", choices=["stable", "legacy"], default="stable", help="Tie-breaking method.")
+    parser.add_argument("--executor", choices=["lasp", "thesis"], default="lasp",
+                        help="lasp (default): the upstream parse() above. thesis: "
+                             "the extended resolver over these LaSP features, for "
+                             "the representation ablation; see thesis_parse")
+    parser.add_argument("--norm_mode", choices=["softmax", "zscore", "zscore_sigmoid"],
+                        default="zscore_sigmoid",
+                        help="with --executor thesis only: the resolver's "
+                             "per-relation normalisation")
     
     args = parser.parse_args()
     eval_nr3d(args)

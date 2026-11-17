@@ -198,12 +198,56 @@ if a teacher's winner pool does not cover every frozen validation prompt. Keep
 the rollout files and their `.meta.json` (snapshot, seed, `system_fingerprint`):
 the frozen file is what makes an API teacher reproducible.
 
+### Ablations and interactions
+
+`experiments/ablation/` scores every combination of three factors on the same
+test rows, so each ablation is a paired contrast and each interaction a paired
+difference-in-differences:
+
+| Factor | Full system | Ablated level |
+| --- | --- | --- |
+| parser | LoRA student | untrained teacher: `teacher_qwen` (Qwen3-30B-A3B) or `teacher_gpt4o` |
+| representation | `extended` encoders | `lasp`: upstream LaSP encoders and predicate table (no colour, isolation, thesis wall encoder, smallest/lowest, ordinal rank) |
+| executor | `thesis` (`zscore_sigmoid`) | `lasp` (softmax) |
+
+The resolver equals LaSP's `parse` only under LaSP's arithmetic; the frozen
+`zscore_sigmoid` normalisation is a change, so it is its own factor
+(`tests/test_executor_equivalence.py` checks both statements). The `lasp`
+representation is run in the baseline tree, with `--executor thesis` for the
+thesis-executor cell.
+
+Teacher parses come from the untrained teacher under the rollout prompt, with
+the student's lowering, so only the model changes (training environment):
+
+```bash
+python -m experiments.parser_adaptation.parse_split --representation extended --teacher qwen    # llama-server running
+python -m experiments.parser_adaptation.parse_split --representation extended --teacher gpt4o   # OPENAI_API_KEY set
+```
+
+Then, in the evaluation environment:
+
+```bash
+python -m experiments.ablation plan        # cells, commands, missing inputs
+python -m experiments.ablation run         # builds features per parser arm, scores all cells
+python -m experiments.ablation analyse     # re-run the statistics only
+```
+
+`--parsers`, `--representations` and `--executors` restrict the design (for
+example `--executors thesis` for a parser x representation 2x2). Results go to
+`artifacts/results/ablation/<split>/`: per-cell dumps, `cells.json` (inputs and
+digests), and `ablation.json`/`ablation.md` with the cell table, every ablation
+against the full system, and all main effects and interactions per teacher.
+Effects are in accuracy points; tests are exact paired sign-flip tests (exact
+McNemar for two cells), 95% CIs are seeded bootstraps over expressions, and
+interaction p-values are also Holm-adjusted.
+
 The experiments are grouped by contribution:
 
 | Folder under `experiments/` | Purpose |
 | --- | --- |
 | `parser_adaptation/` | Rollouts, training sets, LoRA training and adapter selection |
 | `representation/` | Feature probes, ablations and sensitivity sweeps |
+| `ablation/` | Parser x representation x executor ablations and interactions |
 | `calibration/` | Normalization, anchor binding and combination rules |
 | `reference_frame/` | Observer-frame and doorway-entry experiments |
 
