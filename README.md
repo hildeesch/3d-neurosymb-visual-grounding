@@ -103,9 +103,9 @@ Transformers and PEFT; command-line flags are unchanged except where noted.
 - Old MLX adapters convert to PEFT without retraining:
   `python scripts/prepare/convert_mlx_adapter.py <mlx_adapter_dir> <peft_dir>`.
 - `train_lora.py` replaces `mlx_lm lora` and takes the same flags and YAML. It
-  differs in a few details (Adam bias correction, loss over real tokens only,
-  LoRA init); see its docstring. Retrained adapters will not reproduce the MLX
-  numbers exactly.
+  uses mlx's Adam (no bias correction, as the thesis runs) and differs in a few
+  details (loss over real tokens only, LoRA init draws); see its docstring.
+  Retrained adapters will not reproduce the MLX numbers exactly.
 - Parse and rollout files record `backend` in their `.meta.json`; resuming
   into a file written by the MLX version is refused.
 

@@ -16,16 +16,22 @@ What is kept from mlx-lm 0.31.3, so arms stay comparable with each other:
   first ``--val-batches``. ``numpy`` is seeded with ``--seed`` and draws in the
   same order as mlx-lm, so eval_parser_assistant_loss.py can replay them;
 * LoRA on every linear layer of the selected blocks, rank and ``scale`` from
-  the YAML (PEFT ``lora_alpha = scale * rank``), constant learning rate, Adam;
+  the YAML (PEFT ``lora_alpha = scale * rank``), constant learning rate;
+* the optimiser: mlx's Adam, which by default has NO bias correction
+  (``MlxAdam`` below). Its steps are larger than PyTorch Adam's early in
+  training -- about 2x on average over 1,000 updates at a constant rate -- so
+  ``torch.optim.Adam`` at the same learning rate under-trains relative to the
+  thesis runs. ``optimizer_config: {adam: {bias_correction: true}}`` in the
+  YAML switches it on, as it would for mlx-lm;
 * an evaluation at iteration 1, every ``--steps-per-eval`` and at the end,
   computed *before* that iteration's update; checkpoints every
   ``--save-every`` as ``<adapter-path>/NNNNNNN_adapters/``; the final adapter
   in ``<adapter-path>`` followed by the log line ``Saved final weights to``.
 
-Known differences, so numbers are not identical to the MLX runs: PyTorch Adam
-applies bias correction (mlx's Adam defaults to none); the logged loss covers
-real target tokens only (mlx also scored one padding target per row); LoRA A
-uses PEFT's Kaiming init; kernels and random streams differ.
+Known differences, so numbers are not identical to the MLX runs: the logged
+loss covers real target tokens only (mlx also scored one padding target per
+row); LoRA A uses PEFT's Kaiming init (the same U(+-1/sqrt(fan_in)) bound as
+mlx, different draws); kernels and random streams differ.
 
 Run settings are written to ``<adapter-path>/training_config.json``.
 """
@@ -59,7 +65,59 @@ DEFAULTS = {
     "val_batches": 25,
     "grad_checkpoint": False,
     "mask_prompt": False,
+    # mlx-lm passes optimizer_config[<name>] to the optimiser; mlx's Adam
+    # defaults to bias_correction=False, which is what the thesis trained with.
+    "optimizer_config": {"adam": {"bias_correction": False}},
 }
+
+
+def mlx_adam_class():
+    """``torch.optim.Optimizer`` reproducing ``mlx.optimizers.Adam``.
+
+    m = b1*m + (1-b1)*g;  v = b2*v + (1-b2)*g^2
+    bias_correction=False (mlx default):  p -= lr * m / (sqrt(v) + eps)
+    bias_correction=True:  p -= lr/(1-b1^t) * m / (sqrt(v)/sqrt(1-b2^t) + eps)
+    No weight decay, no amsgrad. Built lazily so importing this module does
+    not need torch.
+    """
+    import torch
+
+    class MlxAdam(torch.optim.Optimizer):
+        def __init__(self, params, lr, betas=(0.9, 0.999), eps=1e-8,
+                     bias_correction=False):
+            super().__init__(params, dict(lr=lr, betas=tuple(betas), eps=eps,
+                                          bias_correction=bool(bias_correction)))
+
+        @torch.no_grad()
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for group in self.param_groups:
+                b1, b2 = group["betas"]
+                lr, eps = group["lr"], group["eps"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        state["step"] = 0
+                        state["m"] = torch.zeros_like(p)
+                        state["v"] = torch.zeros_like(p)
+                    state["step"] += 1
+                    m, v, g = state["m"], state["v"], p.grad
+                    m.mul_(b1).add_(g, alpha=1 - b1)
+                    v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                    if group["bias_correction"]:
+                        t = state["step"]
+                        denom = (v.sqrt() / (1 - b2 ** t) ** 0.5).add_(eps)
+                        p.addcdiv_(m, denom, value=-lr / (1 - b1 ** t))
+                    else:
+                        p.addcdiv_(m, v.sqrt().add_(eps), value=-lr)
+            return loss
+
+    return MlxAdam
 
 #: Sequence positions per lm_head chunk; bounds the float32 logits held at once
 LOSS_CHUNK = 256
@@ -99,8 +157,11 @@ def resolve_config(args) -> dict:
         import yaml
         loaded = yaml.safe_load(Path(args.config).read_text()) or {}
         lora = loaded.pop("lora_parameters", {}) or {}
+        opt_cfg = loaded.pop("optimizer_config", {}) or {}
         cfg.update(loaded)
         cfg["lora_parameters"].update(lora)
+        for name, values in opt_cfg.items():
+            cfg["optimizer_config"].setdefault(name, {}).update(values or {})
     for key in ("batch_size", "iters", "learning_rate", "max_seq_length", "num_layers",
                 "save_every", "steps_per_eval", "steps_per_report", "val_batches",
                 "seed", "grad_checkpoint", "mask_prompt"):
@@ -346,7 +407,13 @@ def main(argv=None) -> int:
                          config=cfg)
 
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.Adam(params, lr=cfg["learning_rate"])
+    adam = cfg["optimizer_config"].get("adam", {})
+    unknown = set(adam) - {"betas", "eps", "bias_correction"}
+    if unknown:
+        sys.exit(f"optimizer_config.adam: unsupported keys {sorted(unknown)}")
+    opt = mlx_adam_class()(params, lr=cfg["learning_rate"], **adam)
+    print(f"optimizer: mlx Adam, bias_correction="
+          f"{opt.defaults['bias_correction']}", flush=True)
     pad_id = tokenizer.pad_token_id
     batches = train_batches(train_groups)
     iters = cfg["iters"]
