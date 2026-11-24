@@ -6,8 +6,15 @@ the training-set builders consume any of them unchanged:
 
   hf        a local Hugging Face model through PyTorch (default: Qwen3-30B-A3B)
   llamacpp  a GGUF model served by a running llama.cpp ``llama-server``; fits
-            Qwen3-30B-A3B on a 16 GB GPU by keeping some experts in system RAM
+            a 30B-A3B teacher on a 16 GB GPU by keeping some experts in system RAM
   openai    an OpenAI chat model (default: gpt-4o-2024-08-06), n samples per call
+
+``--teacher qwen|qwen_coder`` picks a local teacher of the distillation grid
+(grounding.parsing.models): its Hugging Face id for ``hf``, and for ``llamacpp``
+the tokenizer whose chat template renders the prompt. The served GGUF is
+checked against it, so a Qwen3-Coder server is never prompted with the Qwen3
+template or the reverse. ``qwen_coder`` writes to
+``data/rollouts/nr3d_rollouts_qwen_coder_<prompt>.jsonl`` by default.
 
 Every output gets ``<output>.meta.json`` recording backend, model, prompt hash,
 decoding and seed. Resuming into a file written under different settings is
@@ -30,10 +37,20 @@ from grounding.parsing import PROMPTS, extract_json_objects
 from grounding.parsing.generation import (add_model_args, batch_generate,
                                           batch_seed, load_model,
                                           template_prompt)
-from grounding.parsing.llamacpp_backend import add_llamacpp_args
+from grounding.parsing.llamacpp_backend import (add_llamacpp_args,
+                                                resolve_template_tokenizer)
+from grounding.parsing.models import DEFAULT_TEACHER, TEACHERS
 from grounding.parsing.openai_backend import DEFAULT_OPENAI_MODEL
 
-DEFAULT_HF_MODEL = "Qwen/Qwen3-30B-A3B"
+DEFAULT_HF_MODEL = TEACHERS[DEFAULT_TEACHER].hf
+
+
+def default_output(teacher: str | None, backend: str, model: str, prompt: str) -> Path:
+    """Default rollout file. The Qwen3-30B names are the historical ones."""
+    if teacher not in (None, DEFAULT_TEACHER):
+        return Path(f"data/rollouts/nr3d_rollouts_{teacher}_{prompt}.jsonl")
+    tag = "" if backend == "hf" else "_" + Path(model.replace("/", "_")).stem
+    return Path(f"data/rollouts/nr3d_rollouts_{prompt}{tag}.jsonl")
 
 
 def load_rows(path: Path, limit: int) -> list[dict]:
@@ -88,6 +105,7 @@ def invocation(args, system: str) -> dict:
         "command": " ".join(sys.argv),
         "input": str(args.input),
         "backend": args.backend,
+        "teacher": getattr(args, "teacher", None),
         "model": args.model,
         "prompt": args.prompt,
         "prompt_sha256": hashlib.sha256(system.encode()).hexdigest(),
@@ -175,6 +193,8 @@ def connect_llamacpp(args):
     print(f"Connecting to llama-server at {args.server_url} ...", flush=True)
     props = server.wait_ready()
     gguf = server.model_name(props)
+    # The template follows the served model; a mismatch stops here
+    resolve_template_tokenizer(args, gguf, teacher=args.teacher)
     args.model = args.model or gguf
     args.server_info = {"url": args.server_url, "gguf": gguf,
                         "total_slots": props.get("total_slots"),
@@ -183,7 +203,8 @@ def connect_llamacpp(args):
     if slots and args.workers > slots:
         print(f"  note: {args.workers} workers but the server has {slots} slots; "
               "extra requests queue", flush=True)
-    print(f"  serving {gguf} ({slots} slots)", flush=True)
+    print(f"  serving {gguf} ({slots} slots), prompts rendered with the "
+          f"{args.tokenizer} chat template", flush=True)
     return server
 
 
@@ -279,9 +300,15 @@ def main() -> int:
                         default="hf",
                         help="hf: local PyTorch model; llamacpp: running "
                              "llama-server (GGUF); openai: OpenAI chat API")
+    parser.add_argument("--teacher", choices=sorted(TEACHERS), default=None,
+                        help="local teacher preset (hf / llamacpp): qwen = "
+                             "Qwen3-30B-A3B, qwen_coder = Qwen3-Coder-30B-A3B-"
+                             "Instruct. Sets the hf model and the llamacpp "
+                             "template tokenizer, and checks the served GGUF")
     parser.add_argument("--model", default=None,
-                        help=f"default: {DEFAULT_HF_MODEL} (hf), the served GGUF "
-                             f"file name (llamacpp) or {DEFAULT_OPENAI_MODEL} (openai)")
+                        help=f"default: the --teacher's id, else {DEFAULT_HF_MODEL} "
+                             "(hf), the served GGUF file name (llamacpp) or "
+                             f"{DEFAULT_OPENAI_MODEL} (openai)")
     parser.add_argument("--limit", type=int, default=2800,
                         help="Number of utterances to process; 0 uses all rows.")
     parser.add_argument("--n-samples", type=int, default=8)
@@ -300,6 +327,11 @@ def main() -> int:
 
     args = parser.parse_args()
     args.workers = args.workers or (8 if args.backend == "llamacpp" else 4)
+    if args.teacher and args.backend == "openai":
+        parser.error("--teacher names a local teacher (hf / llamacpp), not an "
+                     "OpenAI model; use --model for --backend openai")
+    if args.teacher and args.backend == "hf" and args.model is None:
+        args.model = TEACHERS[args.teacher].hf
 
     # Connect before anything is written, so a missing server leaves no file
     server = connect_llamacpp(args) if args.backend == "llamacpp" else None
@@ -307,9 +339,8 @@ def main() -> int:
                                 else DEFAULT_HF_MODEL)
 
     if args.output is None:
-        tag = ("" if args.backend == "hf"
-               else "_" + Path(args.model.replace("/", "_")).stem)
-        args.output = Path(f"data/rollouts/nr3d_rollouts_{args.prompt}{tag}.jsonl")
+        args.output = default_output(args.teacher, args.backend, args.model,
+                                     args.prompt)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     meta_path = Path(str(args.output) + ".meta.json")

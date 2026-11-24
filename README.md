@@ -34,8 +34,9 @@ versions are not a validated lock.
 | --- | --- | --- |
 | Student parsing / scoring | Qwen3-1.7B (+ LoRA) | ~4 GB GPU (bf16), or CPU |
 | Student LoRA training | Qwen3-1.7B, batch 4, `--grad-checkpoint` | ~6–8 GB GPU |
+| Student parsing / training | Qwen2.5-Coder-1.5B-Instruct (`--student coder`) | as Qwen3-1.7B, slightly less |
 | Teacher rollouts | Qwen3-30B-A3B, `--quantize 4bit` | ~18 GB GPU; does not load on a 16 GB GPU |
-| Teacher rollouts | Qwen3-30B-A3B GGUF via `--backend llamacpp` | 16 GB GPU + ~16 GB free RAM (see below) |
+| Teacher rollouts | Qwen3-30B-A3B or Qwen3-Coder-30B-A3B-Instruct GGUF via `--backend llamacpp` | 16 GB GPU + ~16 GB free RAM (see below) |
 | Teacher rollouts | `--backend openai` (GPT-4o) | none locally; needs `OPENAI_API_KEY` |
 
 Check your GPU with `nvidia-smi`. All generators take `--device`, `--dtype`
@@ -82,9 +83,12 @@ fitted because GPU and CPU share one memory pool.)
      --output data/rollouts/nr3d_rollouts_qwen.jsonl
    ```
 
-The prompt is rendered with the Hugging Face tokenizer of `Qwen/Qwen3-30B-A3B`
-(only tokenizer files are downloaded; `--tokenizer` to change), thinking off,
-identically to the other backends, and sent as text to `/completion`. Sampling
+The prompt is rendered with the Hugging Face tokenizer of the served model
+(`Qwen/Qwen3-30B-A3B`, or `Qwen/Qwen3-Coder-30B-A3B-Instruct` for the coder
+GGUF; only tokenizer files are downloaded), thinking off, identically to the
+other backends, and sent as text to `/completion`. The tokenizer follows the
+`--teacher` preset or the served GGUF's name; a mismatch between the two (or
+with an explicit `--tokenizer`) is refused. Sampling
 is pure temperature (llama.cpp's default top-k/top-p/min-p are switched off per
 request) and every sample has its own seed. `parse_split.py --backend llamacpp`
 does the same for greedy zero-shot parses. For the paper: this teacher is the
@@ -198,6 +202,50 @@ if a teacher's winner pool does not cover every frozen validation prompt. Keep
 the rollout files and their `.meta.json` (snapshot, seed, `system_fingerprint`):
 the frozen file is what makes an API teacher reproducible.
 
+### Teacher x student grid (Qwen3-Coder teacher, Qwen2.5-Coder student)
+
+Two teachers and two students, every pair trained the same way:
+
+| | teacher `qwen`: Qwen3-30B-A3B | teacher `qwen_coder`: Qwen3-Coder-30B-A3B-Instruct |
+| --- | --- | --- |
+| student `qwen3`: Qwen3-1.7B | `student` (thesis system) | `student_from_qwen_coder` |
+| student `coder`: Qwen2.5-Coder-1.5B-Instruct | `student_coder` | `student_coder_from_qwen_coder` |
+| zero-shot | `teacher_qwen` | `teacher_qwen_coder` |
+
+The coder teacher has the same 30B-total / 3B-active MoE layout, so it runs
+through llama.cpp exactly like the Qwen3 teacher (Q4_K_M GGUF from
+`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`, ~17.3 GB). Its rollouts use the
+same prompts (the frozen 8750-prompt draw), prompt v4, T=0.7, 8 samples and 320
+tokens as the thesis pool. Every student is trained on the maintained arm
+(`sft_v4_ext_random_size_matched`, 3908 prompts x 2 rows) of its teacher's
+winners with the same LoRA YAML, 1000 updates and seeds 0-2. The seed is chosen
+on dev with `select_adapter.py`, then the test rows are parsed greedily. The
+thesis pair (Qwen3-1.7B <- Qwen3-30B-A3B) is the maintained student and is not
+re-run. Another teacher's pool is built with `build_uniform_sets.py
+--foreign-pool`: the frozen validation ids stay out of training (ids that
+teacher found no winner for are reported), and the random arm still draws 3908
+prompts, so every student gets a training set of the same size.
+
+`experiments/parser_adaptation/teacher_student_grid.py` knows every path and
+command. `plan` shows each step's status and command; `run` executes the
+missing steps in this environment and skips finished outputs:
+
+```bash
+python -m experiments.parser_adaptation.teacher_student_grid plan --todo
+# llama-server serving Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf:
+python -m experiments.parser_adaptation.teacher_student_grid run --teachers qwen_coder --steps rollouts zeroshot
+python -m experiments.parser_adaptation.teacher_student_grid run --teachers qwen_coder --steps filter winners sets
+# training environment, all three new pairs:
+python -m experiments.parser_adaptation.teacher_student_grid run --steps train dev select parse
+```
+
+The individual scripts take the same presets: `generate_rollouts.py --teacher
+qwen_coder`, `parse_split.py --teacher qwen_coder` (zero-shot) or `--student
+coder --adapter ...`, and `train_sft_arms.py --student coder`. A
+`train_sft_arms.py` run refuses an adapter directory that holds another base
+model's or training set's adapter, so each pair needs its own `--adapters` and
+`--logs`.
+
 ### Ablations and interactions
 
 `experiments/ablation/` scores every combination of three factors on the same
@@ -206,7 +254,7 @@ difference-in-differences:
 
 | Factor | Full system | Ablated level |
 | --- | --- | --- |
-| parser | LoRA student | untrained teacher: `teacher_qwen` (Qwen3-30B-A3B) or `teacher_gpt4o` |
+| parser | LoRA student (Qwen3-1.7B <- Qwen3-30B-A3B) | the other three students of the teacher x student grid; untrained teachers `teacher_qwen`, `teacher_qwen_coder`, `teacher_gpt4o` (opt-in) |
 | representation | `extended` encoders | `lasp`: upstream LaSP encoders and predicate table (no colour, isolation, thesis wall encoder, smallest/lowest, ordinal rank) |
 | executor | `thesis` (`zscore_sigmoid`) | `lasp` (softmax) |
 
@@ -220,9 +268,12 @@ Teacher parses come from the untrained teacher under the rollout prompt, with
 the student's lowering, so only the model changes (training environment):
 
 ```bash
-python -m experiments.parser_adaptation.parse_split --representation extended --teacher qwen    # llama-server running
-python -m experiments.parser_adaptation.parse_split --representation extended --teacher gpt4o   # OPENAI_API_KEY set
+python -m experiments.parser_adaptation.parse_split --representation extended --teacher qwen        # llama-server: Qwen3-30B-A3B
+python -m experiments.parser_adaptation.parse_split --representation extended --teacher qwen_coder  # llama-server: Qwen3-Coder-30B-A3B
+python -m experiments.parser_adaptation.parse_split --representation extended --teacher gpt4o       # OPENAI_API_KEY set
 ```
+
+The student arms come from the teacher x student grid above.
 
 Then, in the evaluation environment:
 
@@ -232,14 +283,27 @@ python -m experiments.ablation run         # builds features per parser arm, sco
 python -m experiments.ablation analyse     # re-run the statistics only
 ```
 
+By default `run` scores the six local parser arms (the four grid students and
+both Qwen teachers) at every representation and executor level: 24 cells.
 `--parsers`, `--representations` and `--executors` restrict the design (for
-example `--executors thesis` for a parser x representation 2x2). Results go to
+example `--executors thesis` for a parser x representation 2x2); add
+`teacher_gpt4o` to `--parsers` to include GPT-4o. Results go to
 `artifacts/results/ablation/<split>/`: per-cell dumps, `cells.json` (inputs and
-digests), and `ablation.json`/`ablation.md` with the cell table, every ablation
-against the full system, and all main effects and interactions per teacher.
-Effects are in accuracy points; tests are exact paired sign-flip tests (exact
-McNemar for two cells), 95% CIs are seeded bootstraps over expressions, and
-interaction p-values are also Holm-adjusted.
+digests), and `ablation.json`/`ablation.md` with a teacher x student accuracy
+table per representation/executor cell, the cell table, every ablation against
+the full system, and three families of factorial designs, each crossed with
+representation and executor:
+
+- grid: teacher[qwen|qwen_coder] x student[qwen3|coder] over the four trained
+  students (the teacher and student main effects and their interaction);
+- distillation: each student against its own teacher, zero-shot;
+- teachers: `teacher_qwen` against each other teacher, zero-shot.
+
+Effects are in accuracy points; +1 is the first level named for each factor
+(the thesis model, or in a distillation design the student), so a negative
+grid effect favours the code model. Tests are exact paired sign-flip tests
+(exact McNemar for two cells), 95% CIs are seeded bootstraps over expressions,
+and interaction p-values are also Holm-adjusted within each family.
 
 The experiments are grouped by contribution:
 
@@ -247,7 +311,7 @@ The experiments are grouped by contribution:
 | --- | --- |
 | `parser_adaptation/` | Rollouts, training sets, LoRA training and adapter selection |
 | `representation/` | Feature probes, ablations and sensitivity sweeps |
-| `ablation/` | Parser x representation x executor ablations and interactions |
+| `ablation/` | Parser (teacher x student grid) x representation x executor ablations and interactions |
 | `calibration/` | Normalization, anchor binding and combination rules |
 | `reference_frame/` | Observer-frame and doorway-entry experiments |
 

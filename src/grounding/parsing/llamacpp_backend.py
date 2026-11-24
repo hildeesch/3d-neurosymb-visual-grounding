@@ -1,14 +1,16 @@
 """Client for a local llama.cpp ``llama-server`` (GGUF models).
 
-Lets a GGUF build of the teacher (e.g. Qwen3-30B-A3B at Q4_K_M) run on a GPU
-too small to hold it: llama-server keeps the MoE expert weights of some layers
-in system RAM (``--n-cpu-moe``) and the rest on the GPU. This is the PC
-counterpart of how the original MLX run fitted on an Apple Silicon laptop.
+Lets a GGUF build of a teacher (Qwen3-30B-A3B or Qwen3-Coder-30B-A3B-Instruct
+at Q4_K_M) run on a GPU too small to hold it: llama-server keeps the MoE
+expert weights of some layers in system RAM (``--n-cpu-moe``) and the rest on
+the GPU. This is the PC counterpart of how the original MLX run fitted on an
+Apple Silicon laptop.
 
-The prompt is rendered here, with the Hugging Face tokenizer's chat template
-(thinking off), exactly as the PyTorch and former MLX paths rendered it, and
-sent as raw text to ``/completion``. The server's own chat template is not
-used, so all three backends condition the model on the same string.
+The prompt is rendered here, with the served model's own Hugging Face chat
+template (thinking off where the model has a thinking mode), exactly as the
+PyTorch and former MLX paths rendered it, and sent as raw text to
+``/completion``. The server's own chat template is not used, so all three
+backends condition the model on the same string.
 
 Sampling is pure temperature sampling, as in the other backends: top-k, top-p,
 min-p and every penalty llama.cpp enables by default are switched off per
@@ -31,7 +33,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["DEFAULT_SERVER_URL", "LlamaCppServer", "Completion", "add_llamacpp_args"]
+__all__ = ["DEFAULT_SERVER_URL", "LlamaCppServer", "Completion", "add_llamacpp_args",
+           "resolve_template_tokenizer"]
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:8080"
 
@@ -138,9 +141,23 @@ class LlamaCppServer:
 def add_llamacpp_args(ap) -> None:
     ap.add_argument("--server-url", default=DEFAULT_SERVER_URL,
                     help="llamacpp: llama-server address (default: %(default)s)")
-    ap.add_argument("--tokenizer", default="Qwen/Qwen3-30B-A3B",
+    ap.add_argument("--tokenizer", default=None,
                     help="llamacpp: Hugging Face tokenizer whose chat template "
-                         "renders the prompt (only tokenizer files are downloaded)")
+                         "renders the prompt (only tokenizer files are "
+                         "downloaded). Default: the --teacher preset's, else the "
+                         "one matching the served GGUF (Qwen3-30B-A3B or "
+                         "Qwen3-Coder-30B-A3B-Instruct); a mismatch is refused")
+
+
+def resolve_template_tokenizer(args, gguf: str | None, teacher: str | None = None) -> str:
+    """Fill ``args.tokenizer`` for the served GGUF; exit on a template mismatch."""
+    from grounding.parsing.models import template_tokenizer
+
+    try:
+        args.tokenizer = template_tokenizer(args.tokenizer, teacher=teacher, gguf=gguf)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    return args.tokenizer
 
 
 def load_template_tokenizer(name: str):

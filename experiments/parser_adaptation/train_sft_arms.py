@@ -5,14 +5,25 @@ Defaults are 1000 updates, batch size 4 and the shared LoRA YAML. The margin and
 size-matched random controls compare selection; prompt-uniform, hard150 and
 hard200 compare sampling weights. Completion requires the final-save log marker,
 not merely a checkpoint file. Training runs train_lora.py (PyTorch + PEFT),
-which takes the mlx_lm lora flags. See README.md for inputs and scoring."""
+which takes the mlx_lm lora flags. See README.md for inputs and scoring.
+
+``--student qwen3|coder`` (or ``--model``) picks the base model: Qwen3-1.7B (the
+thesis student) or Qwen2.5-Coder-1.5B-Instruct. The LoRA YAML, update budget,
+batch size and seeds are the same for every student. Each finished adapter
+records its base model and data in ``training_config.json``; a run whose
+directory holds an adapter of another model or training set is refused rather
+than overwritten or skipped as done, so give every (student, teacher) pair its
+own ``--adapters`` and ``--logs`` (teacher_student_grid.py does)."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
+
+from grounding.parsing.models import DEFAULT_STUDENT, STUDENTS
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -34,7 +45,7 @@ ARMS = [
     "sft_v4_ext_prompt_uniform_hard200",
 ]
 
-MODEL = "Qwen/Qwen3-1.7B"
+MODEL = STUDENTS[DEFAULT_STUDENT].hf
 CONFIG = "lora_config_sft_v4_ext.yaml"
 BATCH_SIZE = 4
 SAVE_EVERY = 200
@@ -79,10 +90,41 @@ def finished(name: str, logs: Path) -> bool:
     return log.exists() and DONE_MARKER in log.read_text(errors="ignore")
 
 
-def command(arm: dict, sets_dir: Path, adapters: Path, wandb: bool) -> list[str]:
+def _data_key(path: Path) -> str:
+    """How train_lora.py records --data: repo-relative when inside the repo."""
+    path = Path(path)
+    resolved = path.resolve()
+    return (str(resolved.relative_to(REPO)) if resolved.is_relative_to(REPO)
+            else str(path))
+
+
+def adapter_conflict(arm: dict, sets_dir: Path, adapters: Path,
+                     model: str) -> str | None:
+    """Why ``adapters/<run>`` belongs to another model or training set, if it does.
+
+    train_lora.py writes training_config.json (base model, data directory) at
+    the start of a run; an existing one that disagrees means this directory is
+    another (student, teacher) pair's.
+    """
+    cfg_path = adapters / arm["run"] / "training_config.json"
+    if not cfg_path.exists():
+        return None
+    cfg = json.loads(cfg_path.read_text())
+    want = {"model": model, "data": _data_key(sets_dir / arm["name"])}
+    drift = {k: (cfg.get(k), v) for k, v in want.items() if cfg.get(k) != v}
+    if not drift:
+        return None
+    return (f"{cfg_path} was trained with "
+            + ", ".join(f"{k}={a!r}" for k, (a, _) in drift.items())
+            + ", not " + ", ".join(f"{k}={b!r}" for k, (_, b) in drift.items())
+            + ". Use another --adapters/--logs for this (student, teacher) pair.")
+
+
+def command(arm: dict, sets_dir: Path, adapters: Path, wandb: bool,
+            model: str = MODEL) -> list[str]:
     cmd = [
         sys.executable, "-m", "experiments.parser_adaptation.train_lora",
-        "--model", MODEL, "--train",
+        "--model", model, "--train",
         "--data", str(sets_dir / arm["name"]),
         # Per-(arm, seed) adapter dir so three runs of one arm do not overwrite each other
         "--adapter-path", str(adapters / arm["run"]),
@@ -112,6 +154,11 @@ def main() -> int:
                     default=REPO / "data/training_sets_zscore_sigmoid")
     ap.add_argument("--adapters", type=Path, default=REPO / "artifacts/adapters")
     ap.add_argument("--logs", type=Path, default=REPO / "runs/logs")
+    ap.add_argument("--student", choices=sorted(STUDENTS), default=None,
+                    help="base model: qwen3 = Qwen3-1.7B (default), coder = "
+                         "Qwen2.5-Coder-1.5B-Instruct")
+    ap.add_argument("--model", default=None,
+                    help="Hugging Face id of the base model; overrides --student")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the schedule and the commands, run nothing")
@@ -125,6 +172,7 @@ def main() -> int:
                     help="run just this seed; repeatable (default: all of "
                          f"{TRAIN_SEEDS})")
     args = ap.parse_args()
+    model = args.model or STUDENTS[args.student or DEFAULT_STUDENT].hf
 
     plan = schedule(args.sets, args.iters)
     if args.only:
@@ -143,7 +191,8 @@ def main() -> int:
         print(f"{a['run']:<{w}}  {a['rows']:>10}  {a['iters']:>7}  "
               f"{a['rows_consumed']:>10}  {a['epochs']:>8.4f}")
     # Epochs vary by arm: the consequence of a fixed update budget, reported not smoothed
-    print(f"\nruns: {len(plan)}   total iterations: {sum(a['iters'] for a in plan)}")
+    print(f"\nbase model {model}")
+    print(f"runs: {len(plan)}   total iterations: {sum(a['iters'] for a in plan)}")
     print(f"epochs range {min(a['epochs'] for a in plan):.4f} - "
           f"{max(a['epochs'] for a in plan):.4f}  (not held constant: every run "
           f"gets {plan[0]['iters']} updates)")
@@ -151,14 +200,24 @@ def main() -> int:
     if args.dry_run:
         print("\ncommands:")
         for a in plan:
-            print("  " + " ".join(command(a, args.sets, args.adapters, not args.no_wandb)))
+            print("  " + " ".join(command(a, args.sets, args.adapters,
+                                          not args.no_wandb, model)))
         return 0
+
+    conflicts = [c for a in plan
+                 if (c := adapter_conflict(a, args.sets, args.adapters, model))]
+    if conflicts:
+        sys.exit("refusing to train over adapters of another run:\n  "
+                 + "\n  ".join(conflicts))
 
     args.adapters.mkdir(parents=True, exist_ok=True)
     args.logs.mkdir(parents=True, exist_ok=True)
     failed, skipped = [], []
     for a in plan:
-        if args.skip_done and finished(a["run"], args.logs):
+        # A finished log only counts with its adapter (same model and data,
+        # checked above) next to it
+        if (args.skip_done and finished(a["run"], args.logs)
+                and (args.adapters / a["run"] / "training_config.json").exists()):
             skipped.append(a["run"])
             print(f"\n=== {a['run']}  already trained, skipping", flush=True)
             continue
@@ -166,7 +225,7 @@ def main() -> int:
         print(f"\n=== {a['run']}  {a['iters']} iters -> {log}", flush=True)
         with log.open("w") as f:
             p = subprocess.run(command(a, args.sets, args.adapters,
-                                       not args.no_wandb),
+                                       not args.no_wandb, model),
                                cwd=REPO, stdout=f, stderr=subprocess.STDOUT)
         # One arm's failure must not take the other three down with it
         if p.returncode != 0:

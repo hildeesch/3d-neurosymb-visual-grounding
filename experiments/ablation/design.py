@@ -7,6 +7,21 @@ resolver standardises every relation score and squashes it with a sigmoid
 LaSP exactly -- tests/test_executor_equivalence.py checks this -- so the
 executor factor below isolates that one change.
 
+Parser arms are the distillation grid (experiments/parser_adaptation/
+teacher_student_grid.py): every student model trained on every teacher's
+winners, plus every teacher parsing zero-shot.
+
+    student                        Qwen3-1.7B         <- Qwen3-30B-A3B (full system)
+    student_coder                  Qwen2.5-Coder-1.5B <- Qwen3-30B-A3B
+    student_from_qwen_coder        Qwen3-1.7B         <- Qwen3-Coder-30B-A3B
+    student_coder_from_qwen_coder  Qwen2.5-Coder-1.5B <- Qwen3-Coder-30B-A3B
+    teacher_qwen / teacher_qwen_coder / teacher_gpt4o   zero-shot teachers
+
+Besides its own level, a cell answers ``level("teacher")`` (the model whose
+rollouts trained the student, or that parsed zero-shot) and
+``level("student")`` (the student model, ``none`` for a zero-shot teacher), so
+the teacher x student grid is a factorial design of its own.
+
 What each level holds fixed:
 
 * parser: the parses file. Everything else is identical, including lowering
@@ -33,19 +48,81 @@ from pathlib import Path
 from grounding.resolution.config import BASELINE_RESOLVER, FROZEN_RESOLVER
 from grounding.resolution.harness import feature_relpath
 
-__all__ = ["PARSERS", "TEACHER_PARSERS", "REPRESENTATION_LEVELS",
-           "EXECUTOR_LEVELS", "FULL", "FACTORS", "Cell", "cells",
-           "cell_command", "default_parses", "teacher_parse_command"]
+from experiments.parser_adaptation import teacher_student_grid as grid
+from grounding.parsing.models import STUDENTS, TEACHERS as TEACHER_MODELS
+
+__all__ = ["ParserArm", "PARSER_ARMS", "PARSERS", "TEACHER_PARSERS",
+           "STUDENT_PARSERS", "DEFAULT_PARSERS", "GRID_TEACHERS", "GRID_STUDENTS",
+           "ZERO_SHOT", "REPRESENTATION_LEVELS", "EXECUTOR_LEVELS", "FULL",
+           "FACTORS", "PARSER_ATTRIBUTES", "Cell", "cells", "cell_command",
+           "default_parses", "teacher_parse_command", "student_parse_hint",
+           "grid_arms", "teacher_arm", "model_label"]
 
 
-#: parser level -> default parses file (test split). The student is the
-#: maintained run; the teachers are what ``parse_split.py --teacher`` writes.
-PARSERS = {
-    "student": "data/parses/test/nr3d_test_sft_v4_ext_random_size_matched__seed2.jsonl",
-    "teacher_qwen": "data/parses/test/nr3d_test_teacher_qwen_v4_ext.jsonl",
-    "teacher_gpt4o": "data/parses/test/nr3d_test_teacher_gpt4o_v4_ext.jsonl",
-}
-TEACHER_PARSERS = {"teacher_qwen": "qwen", "teacher_gpt4o": "gpt4o"}
+@dataclass(frozen=True)
+class ParserArm:
+    name: str
+    teacher: str             # teacher model key: qwen | qwen_coder | gpt4o
+    student: str | None      # student model key; None = the teacher, zero-shot
+    label: str
+    parses: str              # default parses file (test split)
+
+
+#: ``level("student")`` of a zero-shot teacher arm
+ZERO_SHOT = "none"
+
+GRID_TEACHERS = tuple(TEACHER_MODELS)     # (qwen, qwen_coder): full level first
+GRID_STUDENTS = tuple(STUDENTS)           # (qwen3, coder): full level first
+
+
+def _arms() -> dict[str, ParserArm]:
+    arms = {}
+    for pair in grid.pairs():
+        arms[pair.name] = ParserArm(pair.name, pair.teacher, pair.student,
+                                    pair.label, pair.test_parses)
+    for key, model in TEACHER_MODELS.items():
+        name = grid.teacher_parser_name(key)
+        arms[name] = ParserArm(name, key, None, f"{model.label} (zero-shot)",
+                               grid.teacher_parses_path(key))
+    arms["teacher_gpt4o"] = ParserArm("teacher_gpt4o", "gpt4o", None,
+                                      "GPT-4o (zero-shot)",
+                                      grid.teacher_parses_path("gpt4o"))
+    return arms
+
+
+#: parser level -> what it is. Students are the grid's test parses (the full
+#: system's is the maintained run); teachers are what ``parse_split.py
+#: --teacher`` writes.
+PARSER_ARMS: dict[str, ParserArm] = _arms()
+PARSERS = {name: arm.parses for name, arm in PARSER_ARMS.items()}
+TEACHER_PARSERS = {name: arm.teacher for name, arm in PARSER_ARMS.items()
+                   if arm.student is None}
+STUDENT_PARSERS = {name: (arm.student, arm.teacher)
+                   for name, arm in PARSER_ARMS.items() if arm.student is not None}
+#: What ``run`` scores without --parsers: the whole local grid. GPT-4o is opt-in.
+DEFAULT_PARSERS = [name for name in PARSERS if name != "teacher_gpt4o"]
+
+#: Attributes of the parser level that designs can treat as factors
+PARSER_ATTRIBUTES = ("teacher", "student")
+
+
+def model_label(key: str) -> str:
+    """Display name of a teacher or student model key."""
+    if key in TEACHER_MODELS:
+        return TEACHER_MODELS[key].label
+    if key in STUDENTS:
+        return STUDENTS[key].label
+    return {"gpt4o": "GPT-4o"}.get(key, key)
+
+
+def grid_arms() -> dict[tuple[str, str], str]:
+    """(student, teacher) -> parser arm, for every trained pair."""
+    return {(s, t): name for name, (s, t) in STUDENT_PARSERS.items()}
+
+
+def teacher_arm(teacher: str) -> str | None:
+    """The zero-shot parser arm of a teacher model."""
+    return next((n for n, t in TEACHER_PARSERS.items() if t == teacher), None)
 
 #: representation level -> the execution tree whose encoders build features.
 REPRESENTATION_LEVELS = {"extended": "extended", "lasp": "baseline"}
@@ -78,6 +155,10 @@ class Cell:
         return REPRESENTATION_LEVELS[self.representation]
 
     def level(self, factor: str) -> str:
+        if factor == "teacher":
+            return PARSER_ARMS[self.parser].teacher
+        if factor == "student":
+            return PARSER_ARMS[self.parser].student or ZERO_SHOT
         return self.levels[FACTORS.index(factor)]
 
 
@@ -123,6 +204,17 @@ def cell_command(cell: Cell, parses: Path, split: str, totals: str,
 
 def default_parses(parser: str) -> str:
     return PARSERS[parser]
+
+
+def student_parse_hint(parser: str) -> str:
+    """Where a missing student arm's parses come from (training environment)."""
+    student, teacher = STUDENT_PARSERS[parser]
+    if grid.is_reference(student, teacher):
+        return ("the maintained student: python -m experiments.parser_adaptation."
+                "parse_split --representation extended --style sft --adapter "
+                f"artifacts/adapters/{grid.ARM}__seed2 --out {PARSERS[parser]}")
+    return ("python -m experiments.parser_adaptation.teacher_student_grid plan "
+            f"--students {student} --teachers {teacher}   # then `run` the steps it lists")
 
 
 def teacher_parse_command(parser: str, rows: str = "data/corpora/nr3d_test.csv",

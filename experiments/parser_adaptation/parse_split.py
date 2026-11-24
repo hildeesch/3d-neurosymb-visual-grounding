@@ -10,14 +10,20 @@ prompt and user turn to an OpenAI chat model (greedy, T=0) for the zero-shot
 ``--backend llamacpp`` sends the identically rendered prompt to a running
 llama.cpp ``llama-server`` (a GGUF model such as Qwen3-30B-A3B), greedy.
 
-``--teacher qwen|gpt4o`` is the semantic-parsing ablation: the untrained
-teacher parses the test rows in place of the LoRA student. It selects the
+``--teacher qwen|qwen_coder|gpt4o`` is the semantic-parsing ablation: the
+untrained teacher parses the test rows in place of the LoRA student. It selects the
 ``rollout`` style -- the v4 system prompt and the same user turn the teacher
 saw when it generated the distillation rollouts (chat template, thinking off) --
 greedy decoding, and the student's non-repairing clean/lower step, so the
-ablation changes the model and nothing else. ``qwen`` defaults to the
-llama.cpp backend (the 16 GB route; pass ``--backend hf`` for Transformers),
-``gpt4o`` to the OpenAI API.
+ablation changes the model and nothing else. ``qwen`` (Qwen3-30B-A3B) and
+``qwen_coder`` (Qwen3-Coder-30B-A3B-Instruct) default to the llama.cpp backend
+(the 16 GB route; pass ``--backend hf`` for Transformers), ``gpt4o`` to the
+OpenAI API. On llama.cpp the prompt is rendered with the served teacher's own
+chat template; a GGUF that is not the requested teacher is refused.
+
+``--student qwen3|coder`` selects the base model of a LoRA student
+(Qwen3-1.7B or Qwen2.5-Coder-1.5B-Instruct) for ``--style sft``; pass the
+adapter trained on that base with ``--adapter``. ``--model`` still overrides.
 """
 from __future__ import annotations
 
@@ -40,7 +46,10 @@ from grounding.parsing.generation import (add_model_args, batch_generate,
                                           encode_chat, free_memory, load_model,
                                           template_prompt)
 from grounding.parsing.generation import chat_text
-from grounding.parsing.llamacpp_backend import add_llamacpp_args
+from grounding.parsing.llamacpp_backend import (add_llamacpp_args,
+                                                resolve_template_tokenizer)
+from grounding.parsing.models import DEFAULT_STUDENT, STUDENTS
+from grounding.parsing.models import TEACHERS as TEACHER_MODELS
 from grounding.parsing.openai_backend import DEFAULT_OPENAI_MODEL
 from grounding.resolution.artifacts import git_commit, sha256
 
@@ -67,9 +76,10 @@ V4_TURN_STYLES = ("sft", "rollout")
 #: backend; backends: the ones that serve this teacher; model: default model per
 #: backend (None = the served GGUF's own name); max_tokens: the rollouts' budget.
 TEACHERS = {
-    "qwen": {"backend": "llamacpp", "backends": ("llamacpp", "hf"),
-             "model": {"hf": "Qwen/Qwen3-30B-A3B", "llamacpp": None},
-             "max_tokens": 320},
+    **{key: {"backend": "llamacpp", "backends": ("llamacpp", "hf"),
+             "model": {"hf": t.hf, "llamacpp": None},
+             "max_tokens": 320}
+       for key, t in TEACHER_MODELS.items()},
     "gpt4o": {"backend": "openai", "backends": ("openai",),
               "model": {"openai": DEFAULT_OPENAI_MODEL},
               "max_tokens": 320},
@@ -84,13 +94,21 @@ def teacher_out(teacher: str, rows_path: Path) -> str:
 
 
 def apply_teacher(args, ap) -> None:
-    """Fill the --teacher preset into flags the user left unset."""
+    """Fill the --teacher (or --student) preset into flags the user left unset."""
+    student = getattr(args, "student", None)
     if args.teacher is None:
         for name, default in (("style", "sft"), ("backend", "hf"),
                               ("max_tokens", 256)):
             if getattr(args, name) is None:
                 setattr(args, name, default)
+        if student is not None:
+            if args.backend != "hf":
+                ap.error("--student is a local Transformers model; use --backend hf")
+            if args.model is None:
+                args.model = STUDENTS[student].hf
         return
+    if student is not None:
+        ap.error("--student and --teacher are two different parsers; pass one")
     preset = TEACHERS[args.teacher]
     if args.adapter:
         ap.error("--teacher is the untrained teacher; it takes no --adapter")
@@ -158,6 +176,7 @@ def invocation(args, rows_path: Path, version: str, system: str,
         "backend": args.backend,
         "model": args.model, "adapter": args.adapter,
         "teacher": args.teacher,
+        "student": getattr(args, "student", None),
         "representation": representation,
         "style": args.style, "prompt": version,
         "prompt_sha256": hashlib.sha256(system.encode()).hexdigest(),
@@ -203,8 +222,13 @@ def main() -> int:
                          "with --teacher")
     ap.add_argument("--teacher", choices=sorted(TEACHERS), default=None,
                     help="semantic-parsing ablation: parse with the untrained "
-                         "teacher (qwen = Qwen3-30B-A3B, gpt4o = GPT-4o) under "
+                         "teacher (qwen = Qwen3-30B-A3B, qwen_coder = "
+                         "Qwen3-Coder-30B-A3B-Instruct, gpt4o = GPT-4o) under "
                          "the rollout prompt; see the module docstring")
+    ap.add_argument("--student", choices=sorted(STUDENTS), default=None,
+                    help="base model of a LoRA student (qwen3 = Qwen3-1.7B, "
+                         "coder = Qwen2.5-Coder-1.5B-Instruct); sets --model. "
+                         f"Default without --model: {STUDENTS[DEFAULT_STUDENT].hf}")
     ap.add_argument("--backend", choices=["hf", "llamacpp", "openai"], default=None,
                     help="default: hf, or the --teacher preset's backend. "
                          "hf: local PyTorch model; llamacpp: running llama-server "
@@ -249,9 +273,14 @@ def main() -> int:
         from grounding.parsing.llamacpp_backend import LlamaCppServer
 
         server = LlamaCppServer(args.server_url, workers=args.workers)
-        args.model = args.model or server.model_name(server.wait_ready())
+        gguf = server.model_name(server.wait_ready())
+        # A local teacher preset must be the model llama-server is serving,
+        # rendered with that model's own chat template
+        local_teacher = args.teacher if args.teacher in TEACHER_MODELS else None
+        resolve_template_tokenizer(args, gguf, teacher=local_teacher)
+        args.model = args.model or gguf
     args.model = args.model or (DEFAULT_OPENAI_MODEL if args.backend == "openai"
-                                else "Qwen/Qwen3-1.7B")
+                                else STUDENTS[DEFAULT_STUDENT].hf)
     if args.backend == "openai":
         if args.style == "sft":
             ap.error("--backend openai needs --style teacher, fused or rollout; "

@@ -4,6 +4,14 @@ Weighting duplicates prompts because the trainer (train_lora.py, which mirrors
 mlx_lm.lora) has no per-example weight.
 Each arm uses the same per-prompt budget and a fixed seed; the validation split
 holds out complete prompts. The margin and random controls are size-matched.
+
+``--foreign-pool`` builds from a pool other than the frozen Qwen3-30B R=8 pool,
+e.g. the Qwen3-Coder teacher's. The frozen validation ids are still withheld
+from training, but ids that teacher found no winner for are reported instead of
+refused (the validation set is the covered subset). The margin arm's
+3908-prompt lock describes the frozen pool only, so it is reported, not
+enforced; ``random_size_matched`` still draws 3908 prompts, so every teacher's
+student gets a training set of the same size.
 """
 from __future__ import annotations
 
@@ -30,6 +38,11 @@ VALID_PROMPTS_FILE = REPO_ROOT / "experiments/parser_adaptation/validation_split
 #: Seed for the random_size_matched draw, and nothing else
 CONSTRUCTION_SEED = 1234
 
+#: Set by --foreign-pool: the pool is not the frozen Qwen3-30B R=8 pool
+FOREIGN_POOL = False
+#: Frozen validation ids the (foreign) pool has no winner for; reported in stats
+UNCOVERED_VALID: set[int] = set()
+
 
 def load_valid_prompts(covered: list[int]) -> set[int]:
     """Load frozen validation IDs; fail if any are absent from the current pool."""
@@ -40,6 +53,15 @@ def load_valid_prompts(covered: list[int]) -> set[int]:
     art = json.loads(VALID_PROMPTS_FILE.read_text())
     ids = set(art["valid_prompt_ids"])
     missing = ids - set(covered)
+    if missing and FOREIGN_POOL:
+        # Still withheld from training: they are not covered, so no arm can
+        # draw them. Validation shrinks to the ids this teacher solved.
+        UNCOVERED_VALID.clear()
+        UNCOVERED_VALID.update(missing)
+        print(f"  NOTE (--foreign-pool): {len(missing)} of {len(ids)} frozen "
+              "validation prompts have no winner in this pool; validation uses "
+              f"the other {len(ids) - len(missing)}, none of them is trained on")
+        return ids & set(covered)
     if missing:
         raise SystemExit(
             f"{len(missing)} frozen validation prompts are absent from the "
@@ -256,6 +278,9 @@ def write_variant(name, pool, train, valid, out_root, config, **details):
     write_set(out_root / name, train, valid)
     stats = describe(name, train, pool, len(valid))
     stats["config"] = config
+    stats["foreign_pool"] = FOREIGN_POOL
+    if FOREIGN_POOL:
+        stats["frozen_valid_prompts_uncovered"] = len(UNCOVERED_VALID)
     stats.update(details)
     (out_root / name / "stats.json").write_text(json.dumps(stats, indent=2))
     return stats
@@ -325,7 +350,10 @@ def build_margin_filtered(name: str, pool: dict[int, list[dict]], system: str,
     kept_valid = sorted(p for p in kept if p in valid_prompts)
 
     # Refuse a changed pool before producing size-matched comparisons
-    if len(train_prompts) != EXPECTED_MARGIN_TRAIN_PROMPTS:
+    if FOREIGN_POOL and len(train_prompts) != EXPECTED_MARGIN_TRAIN_PROMPTS:
+        print(f"  NOTE (--foreign-pool): margin cut yields {len(train_prompts)} "
+              f"train prompts (the frozen pool's is {EXPECTED_MARGIN_TRAIN_PROMPTS})")
+    elif len(train_prompts) != EXPECTED_MARGIN_TRAIN_PROMPTS:
         raise SystemExit(
             f"margin cut yields {len(train_prompts)} train prompts, expected "
             f"{EXPECTED_MARGIN_TRAIN_PROMPTS} (tau={tau:.6f}). The winner pool "
@@ -399,7 +427,10 @@ def build_random_size_matched(name: str, pool: dict[int, list[dict]],
     config = {
         "selection": "uniform random, no margin criterion",
         "construction_seed": CONSTRUCTION_SEED,
-        "size_matched_to": MARGIN_FILTERED,
+        "size_matched_to": (f"{MARGIN_FILTERED} of the frozen Qwen3-30B pool "
+                            f"({n} prompts), so students of every teacher get "
+                            "the same training-set size") if FOREIGN_POOL
+                           else MARGIN_FILTERED,
         "rows_per_prompt_base": BASE_ROWS_PER_PROMPT,
         "includes_recovery": False,
         "fixed_row_budget": False,
@@ -437,7 +468,14 @@ def main() -> int:
                     help="build a single variant")
     ap.add_argument("--force", action="store_true",
                     help="replace a variant directory this script wrote before")
+    ap.add_argument("--foreign-pool", action="store_true",
+                    help="the pool comes from another teacher than the frozen "
+                         "Qwen3-30B R=8 pool: report (do not refuse) frozen "
+                         "validation ids it does not cover and the margin "
+                         "arm's prompt count; see the module docstring")
     args = ap.parse_args()
+    global FOREIGN_POOL
+    FOREIGN_POOL = args.foreign_pool
 
     system = PROMPTS[args.prompt]
     pool = load_pool(REPO_ROOT / args.pool)

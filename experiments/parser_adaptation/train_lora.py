@@ -173,7 +173,9 @@ def resolve_config(args) -> dict:
     if str(cfg["optimizer"]).lower() != "adam":
         sys.exit(f"optimizer {cfg['optimizer']!r} is not supported; use adam")
     cfg["model"] = args.model
-    cfg["data"] = (str(args.data.relative_to(REPO))
+    # resolve() first: a relative --data (as the README passes) is relative to
+    # the working directory, and Path.relative_to would reject it
+    cfg["data"] = (str(args.data.resolve().relative_to(REPO))
                    if args.data.resolve().is_relative_to(REPO) else str(args.data))
     return cfg
 

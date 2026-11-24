@@ -64,3 +64,39 @@ def test_rollout_style_matches_rollout_prompt():
 def test_teacher_out():
     assert ps.teacher_out("gpt4o", Path("data/corpora/nr3d_test.csv")) == \
         "data/parses/test/nr3d_test_teacher_gpt4o_v4_ext.jsonl"
+
+
+def test_qwen_coder_teacher_defaults_to_llamacpp():
+    args = ns(teacher="qwen_coder")
+    ps.apply_teacher(args, _Ap())
+    assert args.style == "rollout" and args.backend == "llamacpp"
+    assert args.model is None and args.max_tokens == 320
+
+
+def test_qwen_coder_teacher_on_transformers():
+    args = ns(teacher="qwen_coder", backend="hf")
+    ps.apply_teacher(args, _Ap())
+    assert args.model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+
+def test_coder_student_preset():
+    args = ns(student="coder")
+    ps.apply_teacher(args, _Ap())
+    assert args.model == "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+    assert (args.style, args.backend) == ("sft", "hf")
+    # an explicit --model still wins
+    args = ns(student="coder", model="local/dir")
+    ps.apply_teacher(args, _Ap())
+    assert args.model == "local/dir"
+
+
+@pytest.mark.parametrize("bad", [dict(student="coder", teacher="qwen"),
+                                 dict(student="coder", backend="llamacpp")])
+def test_student_rejects_confounds(bad):
+    with pytest.raises(SystemExit):
+        ps.apply_teacher(ns(**bad), _Ap())
+
+
+def test_coder_teacher_out():
+    assert ps.teacher_out("qwen_coder", Path("data/corpora/nr3d_test.csv")) == \
+        "data/parses/test/nr3d_test_teacher_qwen_coder_v4_ext.jsonl"
