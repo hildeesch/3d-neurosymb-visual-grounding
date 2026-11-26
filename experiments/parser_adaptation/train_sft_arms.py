@@ -63,7 +63,7 @@ def train_rows(name: str, sets_dir: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
-def schedule(sets_dir: Path, iters: int = ITERS) -> list[dict]:
+def schedule(sets_dir: Path, iters: int = ITERS, arms=ARMS) -> list[dict]:
     """One entry per (arm, seed). Every run gets the same update budget.
 
     `epochs` is still reported, because it is no longer held constant and so
@@ -71,7 +71,7 @@ def schedule(sets_dir: Path, iters: int = ITERS) -> list[dict]:
     is covered less. It is a diagnostic here, not a control.
     """
     out = []
-    for a in ARMS:
+    for a in arms:
         rows = train_rows(a, sets_dir)
         for seed in TRAIN_SEEDS:
             out.append({"name": a, "seed": seed, "rows": rows, "iters": iters,
@@ -174,12 +174,13 @@ def main() -> int:
     args = ap.parse_args()
     model = args.model or STUDENTS[args.student or DEFAULT_STUDENT].hf
 
-    plan = schedule(args.sets, args.iters)
+    # Filter arms before counting rows: a set dir may hold only the arms asked for
     if args.only:
-        unknown = set(args.only) - {a["name"] for a in plan}
+        unknown = set(args.only) - set(ARMS)
         if unknown:
             sys.exit(f"unknown arm(s): {sorted(unknown)}")
-        plan = [a for a in plan if a["name"] in set(args.only)]
+    plan = schedule(args.sets, args.iters,
+                    [a for a in ARMS if not args.only or a in set(args.only)])
     if args.seeds:
         plan = [a for a in plan if a["seed"] in set(args.seeds)]
 

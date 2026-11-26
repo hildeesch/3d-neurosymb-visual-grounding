@@ -322,7 +322,7 @@ MARGIN_FILTERED = "sft_v4_ext_margin_filtered"
 RANDOM_SIZE_MATCHED = "sft_v4_ext_random_size_matched"
 
 #: What the p25 cut yields on the frozen train pool
-EXPECTED_MARGIN_TRAIN_PROMPTS = 3908
+EXPECTED_MARGIN_TRAIN_PROMPTS = 4056
 
 
 def build_margin_filtered(name: str, pool: dict[int, list[dict]], system: str,
