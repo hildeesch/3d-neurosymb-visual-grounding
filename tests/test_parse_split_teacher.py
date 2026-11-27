@@ -53,17 +53,17 @@ def test_teacher_rejects_confounds(bad):
 
 def test_rollout_style_matches_rollout_prompt():
     from experiments.parser_adaptation.generate_rollouts import user_message
-    from grounding.parsing import sft_user_turn
-    version, chat, user_msg, recover = ps.STYLES["rollout"]
-    assert (version, chat, user_msg, recover) == ("v4", True, None, False)
-    assert sft_user_turn("the red chair") == user_message("the red chair")
-    # same post-processing as the student
-    assert recover == ps.STYLES["sft"][3]
+    from grounding.parsing import user_turn
+    # the teacher sees the chat template, the student plain ChatML; both get
+    # the same system prompt and user turn, and the same to_executable step
+    assert ps.STYLES == {"sft": False, "rollout": True}
+    assert user_turn("the red chair") == user_message("the red chair")
+    assert user_turn("the red chair") == "Sentence: the red chair\n\nParsed JSON:"
 
 
 def test_teacher_out():
-    assert ps.teacher_out("gpt4o", Path("data/corpora/nr3d_test.csv")) == \
-        "data/parses/test/nr3d_test_teacher_gpt4o_v4_ext.jsonl"
+    assert ps.teacher_out("gpt4o", Path("data/corpora/nr3d_test.csv"), constrained=False) == \
+        "data/parses/test/nr3d_test_teacher_gpt4o_tree_v1_nogrammar_ext.jsonl"
 
 
 def test_qwen_coder_teacher_defaults_to_llamacpp():
@@ -99,4 +99,4 @@ def test_student_rejects_confounds(bad):
 
 def test_coder_teacher_out():
     assert ps.teacher_out("qwen_coder", Path("data/corpora/nr3d_test.csv")) == \
-        "data/parses/test/nr3d_test_teacher_qwen_coder_v4_ext.jsonl"
+        "data/parses/test/nr3d_test_teacher_qwen_coder_tree_v1_ext.jsonl"

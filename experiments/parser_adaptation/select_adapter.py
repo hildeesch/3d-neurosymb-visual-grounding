@@ -8,6 +8,7 @@ import json
 import sys
 from pathlib import Path
 
+from grounding.parsing.tree import DEFAULT_PROMPT
 from grounding.paths import REPO_ROOT, RESULTS_STAGE3
 from grounding.resolution.config import FROZEN_RESOLVER, shared_resolver
 from grounding.resolution.statistics import mcnemar
@@ -118,14 +119,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--alpha", type=float, default=0.05,
                         help="significance for separation from the leader")
-    parser.add_argument("--out", default=str(RESULTS_STAGE3 / "adapter_selection_dev.json"))
+    parser.add_argument("--out", default=str(RESULTS_STAGE3 / DEFAULT_PROMPT / "adapter_selection_dev.json"))
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     paths = ([REPO_ROOT / path for path in args.results] if args.results
-             else sorted(RESULTS_STAGE3.glob("*_seed_*.json")))
+             else sorted((RESULTS_STAGE3 / DEFAULT_PROMPT).glob("*_seed_*.json")))
     if len(paths) < 2:
         sys.exit(
             f"found {len(paths)} dev result files; need at least two to choose between. "

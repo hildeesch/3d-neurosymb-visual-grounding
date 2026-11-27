@@ -5,6 +5,15 @@ objects in ScanNet scenes. It extends LaSP with parser adaptation, colour,
 isolation, wall proximity, ordinal features and score calibration. Reference-frame
 interpretation is studied in a separate experiment.
 
+**This branch (`tree-track`) replaces the v4 parser with a grammar-constrained
+tree parser.** The parser writes the executable program tree directly (prompt
+`tree_v1`), decoding is constrained to a fixed grammar, and `to_executable`
+checks the same grammar afterwards -- it rejects and never repairs. The v4
+`clean_program` / `lower_program` repair and lowering steps are not part of the
+pipeline. See [The tree parser](#the-tree-parser). Every parser output on this
+branch has `tree_v1` in its name and its own directory, so the v4 parser's
+artifacts and results in the same working tree are never overwritten.
+
 ## Setup
 
 Use Python 3.10 or later. Run commands from the repository root:
@@ -76,11 +85,12 @@ fitted because GPU and CPU share one memory pool.)
    ```
    `-np 8` serves 8 requests in parallel (one prompt's 8 samples); `-c` is
    shared between them, so each gets 2048 tokens, enough for prompt + output.
-4. **Generate** (try `--limit 20` first to check speed and valid-JSON rate):
+4. **Generate** (try `--limit 20` first to check speed and the share of
+   samples outside the grammar):
    ```bash
    python -m experiments.parser_adaptation.generate_rollouts --backend llamacpp \
-     --prompt v4 --limit 8750 --n-samples 8 --temp 0.7 \
-     --output data/rollouts/nr3d_rollouts_qwen.jsonl
+     --teacher qwen --limit 8750 --n-samples 8 --temp 0.7
+   # -> data/rollouts/nr3d_rollouts_qwen_tree_v1.jsonl
    ```
 
 The prompt is rendered with the Hugging Face tokenizer of the served model
@@ -139,92 +149,82 @@ With development parses available, build features and compare the two systems:
 
 ```bash
 python scripts/evaluation/build_features.py \
-  --parses data/parses/dev/nr3d_dev_30b_v4.jsonl --split dev
+  --parses data/parses/dev/nr3d_dev_teacher_qwen_tree_v1_ext.jsonl --split dev
 python scripts/evaluation/compare_baseline.py \
-  --parses data/parses/dev/nr3d_dev_30b_v4.jsonl --split dev --totals parses \
-  --norm-mode zscore_sigmoid --out-dir artifacts/results/representation/dev_comparison
+  --parses data/parses/dev/nr3d_dev_teacher_qwen_tree_v1_ext.jsonl --split dev --totals parses \
+  --norm-mode zscore_sigmoid --out-dir artifacts/results/representation/dev_comparison_tree_v1
 ```
 
 Feature building replaces the cache for that system and split. Evaluate using
 the same parses. `--totals parses` scores the supplied subset; `--totals official`
 counts missing test parses as misses.
 
-To generate parses in the training environment:
+### The tree parser
+
+The parser (`src/grounding/parsing/tree.py`) writes the executable schema
+itself: `category` / `color` / `relations` -> `relation_name` / `negative` /
+`rank` / `objects`, anchors as full nodes, so an anchor carries its own
+relations, at most three levels. Relation names and colours come from a closed
+vocabulary (one name per encoder, no synonyms, 18 colours), and each relation
+fixes how many objects it takes. `tree.gbnf()` renders that grammar for
+constrained decoding -- the llama.cpp `grammar` field for a teacher, an
+xgrammar logits processor for a Transformers model -- and `to_executable`
+checks it afterwards: a tree outside it is rejected with a reason
+(`relation_name`, `arity`, `too_deep`, ...) and never repaired.
+
+`--no-grammar` decodes the same prompt without the grammar (the grammar
+ablation; outputs get `_nogrammar` in their names). The OpenAI API cannot
+decode under a grammar, so a GPT-4o parser always needs `--no-grammar`. Every
+`.meta.json` records the prompt id and the grammar's sha256; a resume under a
+different prompt or grammar is refused.
+
+Through the pipeline: rollout samples keep the model's tree and its outcome;
+`filter_rollouts.py` executes `to_executable(tree)` and reports the invalid rate
+per sample and per reason and the depth of the valid and kept trees;
+`build_winner_pool.py` keeps the tree as emitted (rejecting a tree whose keys
+are out of the grammar's order, `key_order`) and ranks winners by cue coverage
+counted by tree relation name at every level; `build_uniform_sets.py` writes
+`tree.dumps(program)` as the assistant turn; `parse_split.py` and
+`score_checkpoint.py` store and score `json_obj = to_executable(tree)`.
+
+The frozen validation split (by prompt id) still holds; ids a teacher's tree
+pool does not cover are reported and never trained on. The size-matched arm
+(`sft_tree_ext_random_size_matched`) draws 3908 prompts -- the v4 margin arm's
+count -- so the tree students train on as many prompts as the v4 students did,
+with the same LoRA YAML (`lora_config_sft_v4_ext.yaml`), 1000 updates and seeds
+0-2.
+
+Zero-shot parses (training environment, llama-server serving the teacher):
 
 ```bash
-python -m experiments.parser_adaptation.parse_split \
-  --representation extended --style teacher --prompt v4 \
-  --model Qwen/Qwen3-30B-A3B --quantize 4bit \
-  --rows data/corpora/nr3d_test.csv --out data/parses/test/nr3d_test_30b_v4.jsonl
+python -m experiments.parser_adaptation.parse_split --representation extended \
+  --teacher qwen --rows data/corpora/nr3d_dev.jsonl           # [--no-grammar]
+python -m experiments.parser_adaptation.score_checkpoint --split dev --n 0 \
+  --rescore data/parses/dev/nr3d_dev_teacher_qwen_tree_v1_ext.jsonl \
+  --out artifacts/results/parser_adaptation/dev/tree_v1/teacher_qwen.json
+# GPT-4o (OPENAI_API_KEY set)
+python -m experiments.parser_adaptation.parse_split --representation extended \
+  --teacher gpt4o --no-grammar
 ```
 
-The same zero-shot parse with GPT-4o (`OPENAI_API_KEY` must be set):
-
-```bash
-python -m experiments.parser_adaptation.parse_split \
-  --representation extended --style teacher --prompt v4 --backend openai \
-  --rows data/corpora/nr3d_test.csv --out data/parses/test/nr3d_test_gpt4o_v4.jsonl
-```
-
-### Comparing teachers
-
-Teacher rollouts can come from the local Qwen model (Transformers or llama.cpp)
-or from GPT-4o. All write
-the same row format, so the rest of the pipeline is shared; give each teacher
-its own file names:
-
-```bash
-# Qwen3-30B teacher (local)
-python -m experiments.parser_adaptation.generate_rollouts --prompt v4 \
-  --limit 8750 --n-samples 8 --temp 0.7 --quantize 4bit \
-  --output data/rollouts/nr3d_rollouts_qwen30b_v4.jsonl
-# GPT-4o teacher (API)
-python -m experiments.parser_adaptation.generate_rollouts --prompt v4 \
-  --limit 8750 --n-samples 8 --temp 0.7 --backend openai \
-  --output data/rollouts/nr3d_rollouts_gpt4o_v4.jsonl
-
-# then, per teacher, with matching names:
-python -m experiments.parser_adaptation.filter_rollouts --representation extended \
-  --rollouts data/rollouts/nr3d_rollouts_gpt4o_v4.jsonl \
-  --output data/distilled/nr3d_keepers_gpt4o_v4_ext.jsonl
-python -m experiments.parser_adaptation.build_winner_pool \
-  --keepers data/distilled/nr3d_keepers_gpt4o_v4_ext.jsonl \
-  --output data/distilled/nr3d_winners_gpt4o_v4_ext.jsonl
-python -m experiments.parser_adaptation.build_uniform_sets \
-  --pool data/distilled/nr3d_winners_gpt4o_v4_ext.jsonl \
-  --out data/training_sets_gpt4o
-python -m experiments.parser_adaptation.train_sft_arms --sets data/training_sets_gpt4o \
-  --adapters artifacts/adapters_gpt4o --logs runs/logs_gpt4o
-```
-
-The frozen validation split is defined by prompt id; `build_uniform_sets` stops
-if a teacher's winner pool does not cover every frozen validation prompt. Keep
-the rollout files and their `.meta.json` (snapshot, seed, `system_fingerprint`):
-the frozen file is what makes an API teacher reproducible.
-
-### Teacher x student grid (Qwen3-Coder teacher, Qwen2.5-Coder student)
+### Teacher x student grid
 
 Two teachers and two students, every pair trained the same way:
 
 | | teacher `qwen`: Qwen3-30B-A3B | teacher `qwen_coder`: Qwen3-Coder-30B-A3B-Instruct |
 | --- | --- | --- |
-| student `qwen3`: Qwen3-1.7B | `student` (thesis system) | `student_from_qwen_coder` |
+| student `qwen3`: Qwen3-1.7B | `student` (full system) | `student_from_qwen_coder` |
 | student `coder`: Qwen2.5-Coder-1.5B-Instruct | `student_coder` | `student_coder_from_qwen_coder` |
 | zero-shot | `teacher_qwen` | `teacher_qwen_coder` |
 
 The coder teacher has the same 30B-total / 3B-active MoE layout, so it runs
 through llama.cpp exactly like the Qwen3 teacher (Q4_K_M GGUF from
-`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`, ~17.3 GB). Its rollouts use the
-same prompts (the frozen 8750-prompt draw), prompt v4, T=0.7, 8 samples and 320
-tokens as the thesis pool. Every student is trained on the maintained arm
-(`sft_v4_ext_random_size_matched`, 3908 prompts x 2 rows) of its teacher's
-winners with the same LoRA YAML, 1000 updates and seeds 0-2. The seed is chosen
-on dev with `select_adapter.py`, then the test rows are parsed greedily. The
-thesis pair (Qwen3-1.7B <- Qwen3-30B-A3B) is the maintained student and is not
-re-run. Another teacher's pool is built with `build_uniform_sets.py
---foreign-pool`: the frozen validation ids stay out of training (ids that
-teacher found no winner for are reported), and the random arm still draws 3908
-prompts, so every student gets a training set of the same size.
+`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`, ~17.3 GB). Each teacher's rollouts
+use the frozen 8750-prompt draw, T=0.7, 8 samples and 320 tokens under the
+grammar. Every student is trained on the size-matched arm of its teacher's
+winners, the seed is chosen on dev with `select_adapter.py`, and the test rows
+are parsed greedily, with and without the grammar. All four pairs are trained
+on this branch.
 
 `experiments/parser_adaptation/teacher_student_grid.py` knows every path and
 command. `plan` shows each step's status and command; `run` executes the
@@ -232,19 +232,25 @@ missing steps in this environment and skips finished outputs:
 
 ```bash
 python -m experiments.parser_adaptation.teacher_student_grid plan --todo
+# llama-server serving Qwen3-30B-A3B-Q4_K_M.gguf:
+python -m experiments.parser_adaptation.teacher_student_grid run --teachers qwen \
+    --steps rollouts zeroshot zeroshot_nogrammar
 # llama-server serving Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf:
-python -m experiments.parser_adaptation.teacher_student_grid run --teachers qwen_coder --steps rollouts zeroshot
-python -m experiments.parser_adaptation.teacher_student_grid run --teachers qwen_coder --steps filter winners sets
-# training environment, all three new pairs:
-python -m experiments.parser_adaptation.teacher_student_grid run --steps train dev select parse
+python -m experiments.parser_adaptation.teacher_student_grid run --teachers qwen_coder \
+    --steps rollouts zeroshot zeroshot_nogrammar
+# server stopped (training environment):
+python -m experiments.parser_adaptation.teacher_student_grid run \
+    --steps filter winners sets train dev select parse parse_nogrammar
 ```
 
-The individual scripts take the same presets: `generate_rollouts.py --teacher
-qwen_coder`, `parse_split.py --teacher qwen_coder` (zero-shot) or `--student
-coder --adapter ...`, and `train_sft_arms.py --student coder`. A
+Outputs per teacher `<t>` and pair `<s>_from_<t>`:
+`data/rollouts/nr3d_rollouts_<t>_tree_v1.jsonl`,
+`data/distilled/nr3d_{keepers,winners}_<t>_tree_v1_ext.jsonl`,
+`data/training_sets_tree_v1_<t>/`, `artifacts/adapters_tree_v1_<s>_from_<t>/`,
+`artifacts/results/parser_adaptation/dev/grid_tree_v1/<s>_from_<t>/` and
+`data/parses/test/nr3d_test_<arm>_tree_v1[_nogrammar]_ext.jsonl`. A
 `train_sft_arms.py` run refuses an adapter directory that holds another base
-model's or training set's adapter, so each pair needs its own `--adapters` and
-`--logs`.
+model's or training set's adapter.
 
 ### Ablations and interactions
 
@@ -264,31 +270,28 @@ The resolver equals LaSP's `parse` only under LaSP's arithmetic; the frozen
 representation is run in the baseline tree, with `--executor thesis` for the
 thesis-executor cell.
 
-Teacher parses come from the untrained teacher under the rollout prompt, with
-the student's lowering, so only the model changes (training environment):
-
-```bash
-python -m experiments.parser_adaptation.parse_split --representation extended --teacher qwen        # llama-server: Qwen3-30B-A3B
-python -m experiments.parser_adaptation.parse_split --representation extended --teacher qwen_coder  # llama-server: Qwen3-Coder-30B-A3B
-python -m experiments.parser_adaptation.parse_split --representation extended --teacher gpt4o       # OPENAI_API_KEY set
-```
-
-The student arms come from the teacher x student grid above.
+Teacher parses come from the untrained teacher under the rollout prompt and
+grammar, with the same `to_executable` step as the students, so only the model
+changes. They and the student arms come from the teacher x student grid above
+(`parse_split.py --teacher gpt4o --no-grammar` for the opt-in GPT-4o arm).
 
 Then, in the evaluation environment:
 
 ```bash
-python -m experiments.ablation plan        # cells, commands, missing inputs
-python -m experiments.ablation run         # builds features per parser arm, scores all cells
-python -m experiments.ablation analyse     # re-run the statistics only
+python -m experiments.ablation plan                 # cells, commands, missing inputs
+python -m experiments.ablation run                  # builds features per parser arm, scores all cells
+python -m experiments.ablation run --no-grammar     # the same on the parses decoded without the grammar
+python -m experiments.ablation analyse              # re-run the statistics only
 ```
 
 By default `run` scores the six local parser arms (the four grid students and
 both Qwen teachers) at every representation and executor level: 24 cells.
 `--parsers`, `--representations` and `--executors` restrict the design (for
 example `--executors thesis` for a parser x representation 2x2); add
-`teacher_gpt4o` to `--parsers` to include GPT-4o. Results go to
-`artifacts/results/ablation/<split>/`: per-cell dumps, `cells.json` (inputs and
+`teacher_gpt4o` to `--parsers` to include GPT-4o (always without the grammar).
+Results go to `artifacts/results/ablation/<split>_tree_v1[_nogrammar]/` (the v4
+parser's results in `artifacts/results/ablation/<split>/` are left alone):
+per-cell dumps, `cells.json` (inputs and
 digests), and `ablation.json`/`ablation.md` with a teacher x student accuracy
 table per representation/executor cell, the cell table, every ablation against
 the full system, and three families of factorial designs, each crossed with
@@ -324,9 +327,8 @@ python -m experiments.calibration.score_aggregation --help
 python -m experiments.reference_frame --help
 ```
 
-Training uses the R=8 teacher pool and the IDs in
-`experiments/parser_adaptation/validation_split.json`. Recovery rollouts are
-excluded. Remove `--dry-run` to train; select adapters on dev data, then pass the
+Training uses each teacher's R=8 tree pool and the IDs in
+`experiments/parser_adaptation/validation_split.json`. Remove `--dry-run` to train; select adapters on dev data, then pass the
 chosen adapter to `parse_split --style sft --adapter <path>`. Adapters are PEFT
 directories; checkpoints are saved as `<adapter>/NNNNNNN_adapters/`.
 
@@ -336,9 +338,10 @@ when comparing experiments.
 
 ## Results
 
-The maintained run is `sft_v4_ext_random_size_matched__seed2`. Its recorded test
-accuracy is **64.28%** (4,811/7,485), versus **61.88%** (4,632/7,485) for the
-baseline using the same parses.
+The v4 parser's maintained run (on `main`) is
+`sft_v4_ext_random_size_matched__seed2`. Its recorded test accuracy is
+**64.28%** (4,811/7,485), versus **61.88%** (4,632/7,485) for the baseline using
+the same parses. The tree parser's results are not recorded yet.
 
 Local results live in `artifacts/results/`, grouped into `final/`, `baselines/`,
 `parser_adaptation/`, `representation/`, `calibration/` and `reference_frame/`.

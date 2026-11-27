@@ -13,12 +13,21 @@ the training-set builders consume any of them unchanged:
 (grounding.parsing.models): its Hugging Face id for ``hf``, and for ``llamacpp``
 the tokenizer whose chat template renders the prompt. The served GGUF is
 checked against it, so a Qwen3-Coder server is never prompted with the Qwen3
-template or the reverse. ``qwen_coder`` writes to
-``data/rollouts/nr3d_rollouts_qwen_coder_<prompt>.jsonl`` by default.
+template or the reverse. A teacher writes to
+``data/rollouts/nr3d_rollouts_<teacher>_tree_v1.jsonl`` by default.
 
-Every output gets ``<output>.meta.json`` recording backend, model, prompt hash,
-decoding and seed. Resuming into a file written under different settings is
-refused, so two teachers never end up in one pool.
+The teacher writes the executable tree directly (grounding.parsing.tree),
+decoded under the tree grammar (llama.cpp ``grammar`` field; xgrammar on the hf
+backend). Each sample stores the model's tree as ``parsed`` and the grammar
+check's ``outcome`` (``ok`` or the InvalidTree reason); nothing is cleaned or
+repaired. ``--no-grammar`` decodes the same prompt unconstrained (the grammar
+ablation) and writes to ``..._nogrammar.jsonl`` by default. The OpenAI backend
+cannot decode under a grammar, so it needs ``--no-grammar``.
+
+Every output gets ``<output>.meta.json`` recording backend, model, prompt id
+and hash, grammar hash, decoding and seed. Resuming into a file written under
+different settings is refused, so two teachers (or a constrained and an
+unconstrained run) never end up in one pool.
 """
 
 from __future__ import annotations
@@ -30,10 +39,13 @@ import json
 import random
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from grounding.parsing import PROMPTS, extract_json_objects
+from grounding.parsing.tree import (DEFAULT_PROMPT, TREE_PROMPTS,
+                                    add_grammar_args, grammar_for,
+                                    grammar_record, parse_generation, user_turn)
 from grounding.parsing.generation import (add_model_args, batch_generate,
                                           batch_seed, load_model,
                                           template_prompt)
@@ -45,12 +57,16 @@ from grounding.parsing.openai_backend import DEFAULT_OPENAI_MODEL
 DEFAULT_HF_MODEL = TEACHERS[DEFAULT_TEACHER].hf
 
 
-def default_output(teacher: str | None, backend: str, model: str, prompt: str) -> Path:
-    """Default rollout file. The Qwen3-30B names are the historical ones."""
-    if teacher not in (None, DEFAULT_TEACHER):
-        return Path(f"data/rollouts/nr3d_rollouts_{teacher}_{prompt}.jsonl")
-    tag = "" if backend == "hf" else "_" + Path(model.replace("/", "_")).stem
-    return Path(f"data/rollouts/nr3d_rollouts_{prompt}{tag}.jsonl")
+def default_output(teacher: str | None, backend: str, model: str,
+                   prompt: str = DEFAULT_PROMPT, constrained: bool = True) -> Path:
+    """Default rollout file: named by teacher, else by model.
+
+    An unconstrained run (``--no-grammar``) gets ``_nogrammar``, so the two
+    arms of the grammar ablation never share a file.
+    """
+    free = "" if constrained else "_nogrammar"
+    who = teacher or Path(model.replace("/", "_")).stem
+    return Path(f"data/rollouts/nr3d_rollouts_{who}_{prompt}{free}.jsonl")
 
 
 def load_rows(path: Path, limit: int) -> list[dict]:
@@ -95,7 +111,7 @@ def completed_rows(path: Path) -> set[int]:
 
 
 def user_message(utterance: str) -> str:
-    return f"Sentence: {utterance}\n\nParsed JSON:"
+    return user_turn(utterance)
 
 
 def invocation(args, system: str) -> dict:
@@ -109,6 +125,8 @@ def invocation(args, system: str) -> dict:
         "model": args.model,
         "prompt": args.prompt,
         "prompt_sha256": hashlib.sha256(system.encode()).hexdigest(),
+        # None for --no-grammar; compared on resume
+        "grammar": grammar_record(getattr(args, "grammar", None)),
         "decoding": {"n_samples": args.n_samples, "temp": args.temp,
                      "top_p": 1.0, "top_k": 0, "max_tokens": args.max_tokens,
                      "seed": args.seed, "thinking": False},
@@ -125,7 +143,7 @@ def invocation(args, system: str) -> dict:
 
 
 def check_resume(meta_path: Path, meta: dict, have_rows: bool) -> None:
-    keys = ("backend", "model", "prompt", "prompt_sha256", "decoding")
+    keys = ("backend", "model", "prompt", "prompt_sha256", "grammar", "decoding")
     if not have_rows:
         meta_path.write_text(json.dumps(meta, indent=2) + "\n")
         return
@@ -140,8 +158,14 @@ def check_resume(meta_path: Path, meta: dict, have_rows: bool) -> None:
                          f"to mix rollouts: {json.dumps(drift, indent=1)}")
 
 
+def sample_record(raw: str) -> dict:
+    """One sample: the model's tree as emitted, and the grammar check's outcome."""
+    parsed, _, outcome = parse_generation(raw)
+    return {"raw": raw, "parsed": parsed, "outcome": outcome}
+
+
 def row_record(row: dict, raw_samples: list[str], extra: dict | None = None) -> dict:
-    samples = [{"raw": raw, "parsed": extract_json_objects(raw)} for raw in raw_samples]
+    samples = [sample_record(raw) for raw in raw_samples]
     rec = {k: row[k] for k in ("row_idx", "stimulus_id", "scan_id", "target_id",
                                "instance_type", "utterance")}
     rec["samples"] = samples
@@ -174,7 +198,8 @@ def run_hf(args, rows, system, fout, stats, loaded) -> None:
 
         response = batch_generate(
             model, tokenizer, prompts=batch_prompts, max_tokens=args.max_tokens,
-            sampler=sampler, seed=batch_seed(args.seed, group[0]["row_idx"]))
+            sampler=sampler, seed=batch_seed(args.seed, group[0]["row_idx"]),
+            grammar=args.grammar)
 
         for i, row in enumerate(group):
             raw_samples = response.texts[i * args.n_samples:(i + 1) * args.n_samples]
@@ -224,7 +249,7 @@ def run_llamacpp(args, rows, system, fout, stats, server) -> None:
         jobs = [(prompts[start + i], batch_seed(args.seed, f"{row['row_idx']}:{k}"))
                 for i, row in enumerate(group) for k in range(args.n_samples)]
         done = server.complete_many(jobs, max_tokens=args.max_tokens,
-                                    temperature=args.temp)
+                                    temperature=args.temp, grammar=args.grammar)
 
         for i, row in enumerate(group):
             outs = done[i * args.n_samples:(i + 1) * args.n_samples]
@@ -269,12 +294,19 @@ def run_openai(args, rows, system, fout, stats, loaded=None) -> None:
 class Stats:
     def __init__(self):
         self.samples = self.valid = self.tokens = 0
+        #: per-sample grammar outcome (ok / InvalidTree reason)
+        self.outcomes: Counter = Counter()
         self.t0 = time.time()
 
     def add(self, rec: dict, tokens: int) -> None:
         self.samples += len(rec["samples"])
         self.valid += sum(s["parsed"] is not None for s in rec["samples"])
+        self.outcomes.update(s["outcome"] for s in rec["samples"])
         self.tokens += tokens
+
+    def invalid_rate(self) -> float:
+        n = sum(self.outcomes.values())
+        return 1 - self.outcomes["ok"] / n if n else 0.0
 
     def rate(self) -> float:
         elapsed = time.time() - self.t0
@@ -282,7 +314,8 @@ class Stats:
 
     def report(self, done: int, total: int) -> None:
         pct = 100 * self.valid / self.samples if self.samples else 0
-        print(f"[{done}/{total}] {self.rate():.1f} tok/s | valid JSON {pct:.0f}%",
+        print(f"[{done}/{total}] {self.rate():.1f} tok/s | valid JSON {pct:.0f}% | "
+              f"outside the grammar {100 * self.invalid_rate():.1f}%",
               file=sys.stderr, flush=True)
 
 
@@ -293,9 +326,10 @@ def main() -> int:
     parser.add_argument("--input", type=Path,
                         default=Path("data/corpora/nr3d_train.csv"))
     parser.add_argument("--output", type=Path, default=None,
-                        help="default: data/rollouts/nr3d_rollouts_<prompt>"
-                             "[_<openai model>].jsonl")
-    parser.add_argument("--prompt", choices=sorted(PROMPTS), default="v3")
+                        help="default: data/rollouts/nr3d_rollouts_<teacher or "
+                             "model>_<prompt>[_nogrammar].jsonl")
+    parser.add_argument("--prompt", choices=sorted(TREE_PROMPTS),
+                        default=DEFAULT_PROMPT, help="parser system prompt id")
     parser.add_argument("--backend", choices=["hf", "llamacpp", "openai"],
                         default="hf",
                         help="hf: local PyTorch model; llamacpp: running "
@@ -309,8 +343,9 @@ def main() -> int:
                         help=f"default: the --teacher's id, else {DEFAULT_HF_MODEL} "
                              "(hf), the served GGUF file name (llamacpp) or "
                              f"{DEFAULT_OPENAI_MODEL} (openai)")
-    parser.add_argument("--limit", type=int, default=2800,
-                        help="Number of utterances to process; 0 uses all rows.")
+    parser.add_argument("--limit", type=int, default=8750,
+                        help="utterances to process (default: the frozen 8750-"
+                             "prompt teacher draw); 0 uses all rows")
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--temp", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=320)
@@ -324,8 +359,13 @@ def main() -> int:
                              "llamacpp (default 8; match llama-server -np)")
     add_model_args(parser)
     add_llamacpp_args(parser)
+    add_grammar_args(parser)
 
     args = parser.parse_args()
+    args.grammar = grammar_for(args.prompt, enabled=not args.no_grammar)
+    if args.grammar is not None and args.backend == "openai":
+        parser.error("the OpenAI API cannot decode under the tree grammar; pass "
+                     "--no-grammar for an unconstrained OpenAI run")
     args.workers = args.workers or (8 if args.backend == "llamacpp" else 4)
     if args.teacher and args.backend == "openai":
         parser.error("--teacher names a local teacher (hf / llamacpp), not an "
@@ -340,12 +380,12 @@ def main() -> int:
 
     if args.output is None:
         args.output = default_output(args.teacher, args.backend, args.model,
-                                     args.prompt)
+                                     args.prompt, args.grammar is not None)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     meta_path = Path(str(args.output) + ".meta.json")
 
-    system = PROMPTS[args.prompt]
+    system = TREE_PROMPTS[args.prompt]
     rows = load_rows(args.input, args.limit)
 
     done = completed_rows(args.output)
@@ -368,6 +408,11 @@ def main() -> int:
 
     print(f"Done. {len(rows)} prompts x {args.n_samples} = {stats.samples} samples "
           f"({stats.valid} parsed). {stats.rate():.1f} tok/s. Wrote {args.output}")
+    if stats.outcomes:
+        mode = "grammar" if args.grammar is not None else "no grammar"
+        print(f"Outcomes ({mode}), this run: "
+              + ", ".join(f"{k} {v}" for k, v in stats.outcomes.most_common())
+              + f" -> {100 * stats.invalid_rate():.1f}% outside the grammar")
 
     return 0
 

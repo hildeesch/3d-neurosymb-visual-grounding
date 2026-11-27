@@ -1,16 +1,16 @@
-"""Extract, clean, and lower model output into executable programs."""
+"""The parser: a grammar-constrained program tree, checked, never repaired.
 
-from grounding.parsing.cleaning import clean_program
+``tree`` holds the prompt, the grammar (GBNF, for llama.cpp and xgrammar) and
+``to_executable``, the post-hoc check. ``cleaning`` and ``lowering`` belong to
+the previous (v4) parser; they stay only because ``cues`` builds its cue
+scanner from their tables and the error analysis of the v4 results reads them.
+The parser pipeline does not call them.
+"""
+
 from grounding.parsing.fields import (
     nodes,
     relation_objects,
     relations,
-)
-from grounding.parsing.lowering import (
-    lower_one,
-    lower_program,
-    normalise_predicate,
-    raw_predicates,
 )
 from grounding.parsing.parse import (
     REPRESENTATIONS,
@@ -19,17 +19,20 @@ from grounding.parsing.parse import (
     normalise_representation,
     representation_tree,
 )
-from grounding.parsing.prompt import (
-    PROMPTS,
-    SYSTEM_PROMPT_V2,
-    SYSTEM_PROMPT_V3,
-    SYSTEM_PROMPT_V4,
-    sft_user_turn,
+from grounding.parsing.tree import (
+    DEFAULT_PROMPT,
+    TREE_PROMPTS,
+    InvalidTree,
+    dumps,
+    grammar_for,
+    grammar_record,
+    is_tree_prompt,
+    parse_generation,
+    to_executable,
+    user_turn,
 )
 from grounding.parsing.schema import (
-    CleanedProgram,
     ExecutableProgram,
-    FlatProgram,
     flat_program_of,
     is_executable,
     is_flat,
@@ -37,27 +40,25 @@ from grounding.parsing.schema import (
 
 __all__ = [
     "REPRESENTATIONS",
-    "PROMPTS",
-    "SYSTEM_PROMPT_V2",
-    "SYSTEM_PROMPT_V3",
-    "SYSTEM_PROMPT_V4",
-    "CleanedProgram",
+    "DEFAULT_PROMPT",
+    "TREE_PROMPTS",
+    "InvalidTree",
     "ExecutableProgram",
-    "FlatProgram",
-    "clean_program",
+    "dumps",
     "extract_json_objects",
     "flat_program_of",
+    "grammar_for",
+    "grammar_record",
     "is_executable",
     "is_flat",
+    "is_tree_prompt",
     "load_rel_num",
-    "lower_one",
-    "lower_program",
-    "normalise_predicate",
     "normalise_representation",
-    "raw_predicates",
-    "representation_tree",
     "nodes",
+    "parse_generation",
     "relation_objects",
     "relations",
-    "sft_user_turn",
+    "representation_tree",
+    "to_executable",
+    "user_turn",
 ]

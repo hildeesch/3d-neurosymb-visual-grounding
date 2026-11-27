@@ -58,9 +58,14 @@ def test_parser_arms_cover_every_teacher_student_pair():
                                       "teacher_gpt4o"}
     # the default run is the whole local grid: 4 students + 2 local teachers
     assert set(D.DEFAULT_PARSERS) == set(D.PARSERS) - {"teacher_gpt4o"}
-    # the maintained student keeps its parses file
-    assert D.PARSERS["student"].endswith("random_size_matched__seed2.jsonl")
+    # every arm is a tree-parser parse; none is a v4 file
+    assert all("_tree_v1" in p and "_v4" not in p for p in D.PARSERS.values())
     assert len(set(D.PARSERS.values())) == len(D.PARSERS)
+    # the grammar ablation has its own files; GPT-4o has no grammar at all
+    free = {n: D.parses_for(n, constrained=False) for n in D.PARSERS}
+    assert all(p.endswith("_tree_v1_nogrammar_ext.jsonl") for p in free.values())
+    assert not set(free.values()) & set(D.PARSERS.values()) - {D.PARSERS["teacher_gpt4o"]}
+    assert D.PARSERS["teacher_gpt4o"] == free["teacher_gpt4o"]
 
 
 def test_cells_expose_teacher_and_student():
@@ -75,5 +80,8 @@ def test_cells_expose_teacher_and_student():
 def test_coder_teacher_parse_command_and_student_hint():
     cmd = D.teacher_parse_command("teacher_qwen_coder")
     assert cmd[cmd.index("--teacher") + 1] == "qwen_coder"
+    assert "--no-grammar" not in cmd
+    assert "--no-grammar" in D.teacher_parse_command("teacher_qwen_coder", constrained=False)
+    assert "--no-grammar" in D.teacher_parse_command("teacher_gpt4o")
     hint = D.student_parse_hint("student_coder")
     assert "--students coder --teachers qwen" in hint

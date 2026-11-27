@@ -1,25 +1,33 @@
-"""Parse CSV or JSONL rows and write lowered executable programs.
+"""Parse CSV or JSONL rows into executable program trees.
 
-Lowering uses the selected representation's vocabulary. Rebuild features from
-the output before evaluation; existing rows are skipped unless ``--fresh`` is set.
+The parser writes the tree directly under the tree system prompt, decoded under
+the tree grammar (llama.cpp ``grammar`` field, xgrammar on hf). Each row stores
+``json_obj = to_executable(tree)`` -- null when the tree is outside the grammar,
+never repaired -- plus the model's tree (``program``) and the check's
+``outcome``. ``--no-grammar`` decodes the same prompt unconstrained (the grammar
+ablation; ``_nogrammar`` in default names); the OpenAI backend needs it.
+Rebuild features from the output before evaluation; existing rows are skipped
+unless ``--fresh`` is set.
 
 ``--backend hf`` (default) runs a local Hugging Face model through PyTorch, with
 an optional PEFT LoRA ``--adapter``. ``--backend openai`` sends the same system
-prompt and user turn to an OpenAI chat model (greedy, T=0) for the zero-shot
-``teacher``/``fused`` styles, so an API parser can be compared on equal terms.
-``--backend llamacpp`` sends the identically rendered prompt to a running
-llama.cpp ``llama-server`` (a GGUF model such as Qwen3-30B-A3B), greedy.
+prompt and user turn to an OpenAI chat model (greedy, T=0). ``--backend
+llamacpp`` sends the identically rendered prompt to a running llama.cpp
+``llama-server`` (a GGUF model such as Qwen3-30B-A3B), greedy.
+
+Two styles render the same system prompt and user turn: ``sft`` as plain
+ChatML (what the LoRA students were trained on) and ``rollout`` through the
+model's chat template with thinking off (what the teachers saw when they
+generated the rollouts).
 
 ``--teacher qwen|qwen_coder|gpt4o`` is the semantic-parsing ablation: the
-untrained teacher parses the test rows in place of the LoRA student. It selects the
-``rollout`` style -- the v4 system prompt and the same user turn the teacher
-saw when it generated the distillation rollouts (chat template, thinking off) --
-greedy decoding, and the student's non-repairing clean/lower step, so the
-ablation changes the model and nothing else. ``qwen`` (Qwen3-30B-A3B) and
-``qwen_coder`` (Qwen3-Coder-30B-A3B-Instruct) default to the llama.cpp backend
-(the 16 GB route; pass ``--backend hf`` for Transformers), ``gpt4o`` to the
-OpenAI API. On llama.cpp the prompt is rendered with the served teacher's own
-chat template; a GGUF that is not the requested teacher is refused.
+untrained teacher parses the rows in place of the LoRA student, with the
+``rollout`` style and greedy decoding, so the ablation changes the model and
+nothing else. ``qwen`` (Qwen3-30B-A3B) and ``qwen_coder``
+(Qwen3-Coder-30B-A3B-Instruct) default to the llama.cpp backend (the 16 GB
+route; pass ``--backend hf`` for Transformers), ``gpt4o`` to the OpenAI API. On
+llama.cpp the prompt is rendered with the served teacher's own chat template; a
+GGUF that is not the requested teacher is refused.
 
 ``--student qwen3|coder`` selects the base model of a LoRA student
 (Qwen3-1.7B or Qwen2.5-Coder-1.5B-Instruct) for ``--style sft``; pass the
@@ -38,10 +46,12 @@ from pathlib import Path
 
 
 from grounding.paths import REPO_ROOT
-from grounding.parsing import (REPRESENTATIONS, extract_json_objects, load_rel_num,
-                               lower_one, normalise_representation,
-                               sft_user_turn)
-from grounding.parsing import PROMPTS
+from grounding.parsing import (REPRESENTATIONS, load_rel_num,
+                               normalise_representation)
+from grounding.parsing.tree import (DEFAULT_PROMPT, TREE_PROMPTS,
+                                    add_grammar_args, grammar_for,
+                                    grammar_record, parse_generation,
+                                    relation_names, user_turn)
 from grounding.parsing.generation import (add_model_args, batch_generate,
                                           encode_chat, free_memory, load_model,
                                           template_prompt)
@@ -53,24 +63,14 @@ from grounding.parsing.models import TEACHERS as TEACHER_MODELS
 from grounding.parsing.openai_backend import DEFAULT_OPENAI_MODEL
 from grounding.resolution.artifacts import git_commit, sha256
 
-# style -> (default prompt version, chat-template?, user message, recover?)
-#
-# ``sft`` is deliberately opt-in.  The older fused/teacher commands retain
-# their prompts and repair policy exactly, while this path mirrors the v4 SFT
-# conditioning and its non-repairing clean/lower step
+#: style -> rendered through the model's chat template?
 STYLES = {
-    "fused":   ("v2", False, "Parse: '{s}'", True),
-    "teacher": ("v3", True,  'Input: "{s}"\nOutput:', True),
-    "sft":     ("v4", False, None, False),
+    # The student's SFT conditioning: plain ChatML, as the training rows
+    "sft": False,
     # The teacher's rollout conditioning (generate_rollouts.user_message is the
-    # same string as sft_user_turn), rendered with the chat template as the
-    # rollouts were, and lowered without recovery exactly like the student.
-    "rollout": ("v4", True, None, False),
+    # same user turn), rendered with the chat template as the rollouts were
+    "rollout": True,
 }
-
-#: Styles whose user turn is the shared v4 SFT/rollout turn, and whose system
-#: prompt is therefore fixed to v4.
-V4_TURN_STYLES = ("sft", "rollout")
 
 #: --teacher presets for the semantic-parsing ablation. backend: default
 #: backend; backends: the ones that serve this teacher; model: default model per
@@ -86,11 +86,18 @@ TEACHERS = {
 }
 
 
-def teacher_out(teacher: str, rows_path: Path) -> str:
+def track_tag(prompt: str = DEFAULT_PROMPT, constrained: bool = True) -> str:
+    """Prompt part of a default output name: e.g. tree_v1 or tree_v1_nogrammar."""
+    return prompt + ("" if constrained else "_nogrammar")
+
+
+def teacher_out(teacher: str, rows_path: Path, prompt: str = DEFAULT_PROMPT,
+                constrained: bool = True) -> str:
     """Default output for a teacher parse of ``rows_path``."""
     stem = rows_path.stem          # nr3d_test, nr3d_dev, ...
     split = "dev" if "dev" in stem else "test"
-    return f"data/parses/{split}/{stem}_teacher_{teacher}_v4_ext.jsonl"
+    tag = track_tag(prompt, constrained)
+    return f"data/parses/{split}/{stem}_teacher_{teacher}_{tag}_ext.jsonl"
 
 
 def apply_teacher(args, ap) -> None:
@@ -159,7 +166,7 @@ def load_rows(path: Path, limit: int = 0) -> tuple[list[dict], bool]:
 
 
 def invocation(args, rows_path: Path, version: str, system: str,
-               representation: str, n_rows: int) -> dict:
+               representation: str, n_rows: int, grammar: str | None = None) -> dict:
     """Everything that decides what a parse row looks like, recorded once.
 
     Written next to --out as `<out>.meta.json` so a frozen parse says how it was
@@ -180,6 +187,8 @@ def invocation(args, rows_path: Path, version: str, system: str,
         "representation": representation,
         "style": args.style, "prompt": version,
         "prompt_sha256": hashlib.sha256(system.encode()).hexdigest(),
+        # None for v2-v5 prompts and --no-grammar; compared on resume
+        "grammar": grammar_record(grammar),
         "decoding": {"sampler": "greedy", "temp": 0.0,
                      "max_tokens": args.max_tokens, "batch_size": args.batch_size,
                      "no_think": bool(args.no_think),
@@ -217,9 +226,9 @@ def main() -> int:
                     help="utterances to parse: the test csv, or a probe jsonl")
     # Defaults describe the zero-shot 1.7B student; the full system supplies --adapter explicitly
     ap.add_argument("--out", default=None,
-                    help="default: data/parses/test/nr3d_test_qwen3_1p7b_v4_ext.jsonl, "
-                         "or data/parses/<split>/<rows>_teacher_<name>_v4_ext.jsonl "
-                         "with --teacher")
+                    help="default: data/parses/test/nr3d_test_qwen3_1p7b_tree_v1"
+                         "[_nogrammar]_ext.jsonl, or data/parses/<split>/<rows>_"
+                         "teacher_<name>_tree_v1[_nogrammar]_ext.jsonl with --teacher")
     ap.add_argument("--teacher", choices=sorted(TEACHERS), default=None,
                     help="semantic-parsing ablation: parse with the untrained "
                          "teacher (qwen = Qwen3-30B-A3B, qwen_coder = "
@@ -233,7 +242,7 @@ def main() -> int:
                     help="default: hf, or the --teacher preset's backend. "
                          "hf: local PyTorch model; llamacpp: running llama-server "
                          "(GGUF, no adapters); openai: OpenAI chat API "
-                         "(teacher/fused/rollout styles only)")
+                         "(rollout style, --no-grammar)")
     ap.add_argument("--model", default=None,
                     help="default: Qwen/Qwen3-1.7B (hf), the served GGUF file "
                          f"name (llamacpp) or {DEFAULT_OPENAI_MODEL} (openai)")
@@ -242,10 +251,10 @@ def main() -> int:
                          "convert old MLX adapters with "
                          "scripts/prepare/convert_mlx_adapter.py")
     ap.add_argument("--style", default=None, choices=sorted(STYLES),
-                    help="prompt formatting recipe (default: sft, or rollout "
-                         "with --teacher); see the module docstring")
-    ap.add_argument("--prompt", default=None, choices=sorted(PROMPTS),
-                    help="prompt version; default is the style's")
+                    help="sft: plain ChatML (students; default); rollout: the "
+                         "chat template, thinking off (teachers; set by --teacher)")
+    ap.add_argument("--prompt", default=DEFAULT_PROMPT, choices=sorted(TREE_PROMPTS),
+                    help="system prompt id (default: %(default)s)")
     # A MoE model reads more expert weights per step, so batch trades sparsity for memory
     ap.add_argument("--batch-size", type=int, default=8,
                     help="prompts per batch_generate call")
@@ -264,6 +273,7 @@ def main() -> int:
                          "match llama-server -np)")
     add_model_args(ap)
     add_llamacpp_args(ap)
+    add_grammar_args(ap)
     args = ap.parse_args()
     apply_teacher(args, ap)
     server = None
@@ -283,28 +293,29 @@ def main() -> int:
                                 else STUDENTS[DEFAULT_STUDENT].hf)
     if args.backend == "openai":
         if args.style == "sft":
-            ap.error("--backend openai needs --style teacher, fused or rollout; "
-                     "the sft style is the fine-tuned local student's format")
+            ap.error("--backend openai needs --style rollout; the sft style is "
+                     "the fine-tuned local student's format")
         if args.adapter or args.no_think:
             ap.error("--adapter and --no-think apply to --backend hf only")
+
+    chat = STYLES[args.style]
+    version = args.prompt
+    system = TREE_PROMPTS[version]
+    grammar = grammar_for(version, enabled=not args.no_grammar)
+    if grammar is not None and args.backend == "openai":
+        ap.error("the OpenAI API cannot decode under the tree grammar; pass "
+                 "--no-grammar")
 
     rows_path = Path(args.rows)
     rows_path = rows_path if rows_path.is_absolute() else REPO_ROOT / rows_path
     if args.out is None:
-        args.out = (teacher_out(args.teacher, rows_path) if args.teacher else
-                    "data/parses/test/nr3d_test_qwen3_1p7b_v4_ext.jsonl")
+        tag = track_tag(version, grammar is not None)
+        args.out = (teacher_out(args.teacher, rows_path, version, grammar is not None)
+                    if args.teacher else
+                    f"data/parses/test/nr3d_test_qwen3_1p7b_{tag}_ext.jsonl")
     if rows_path.suffix == ".csv":
         assert "train" not in rows_path.name.lower(), (
             f"rows look like a train split: {args.rows!r}")
-
-    version, chat, user_msg, recover = STYLES[args.style]
-    if args.style in V4_TURN_STYLES and args.prompt not in (None, "v4"):
-        ap.error(f"--style {args.style} always uses the v4 system prompt")
-    version = args.prompt or version
-    system = PROMPTS[version]
-    # sft_user_turn is the shared implementation behind training_set.user_turn
-    # and generate_rollouts.user_message
-    user_turn = sft_user_turn if args.style in V4_TURN_STYLES else None
     representation = normalise_representation(args.representation)
     rel_num = load_rel_num(representation)
 
@@ -318,7 +329,8 @@ def main() -> int:
             if p.exists():
                 p.unlink()
 
-    meta = invocation(args, rows_path, version, system, representation, len(rows))
+    meta = invocation(args, rows_path, version, system, representation, len(rows),
+                      grammar)
     # A file with rows but no record of how they were made, or a record that
     # disagrees with this invocation, cannot be resumed into: the rows already
     # there and the rows about to be appended would be two populations under
@@ -332,7 +344,7 @@ def main() -> int:
         recorded = json.loads(meta_path.read_text())
         drift = {k: (recorded.get(k), meta[k]) for k in
                  ("rows", "backend", "model", "adapter", "representation", "style",
-                  "prompt", "prompt_sha256", "decoding")
+                  "prompt", "prompt_sha256", "grammar", "decoding")
                  if recorded.get(k) != meta[k]}
         if drift:
             raise SystemExit(
@@ -349,6 +361,9 @@ def main() -> int:
           f"{len(todo)} to do -> {out_path.name}")
     print(f"prompt {version} ({len(system)} chars), style {args.style} | "
           f"{len(rel_num)} relations in {representation}'s vocabulary")
+    print(("decoding under the tree grammar" if grammar
+           else "unconstrained decoding (--no-grammar)")
+          + "; json_obj = to_executable(tree)")
     if args.adapter:
         print(f"adapter {args.adapter}")
     if not todo:
@@ -358,8 +373,7 @@ def main() -> int:
     suffix = " /no_think" if args.no_think else ""
 
     def user_content(sentence: str) -> str:
-        return ((user_turn(sentence) if user_turn else user_msg.format(s=sentence))
-                + suffix)
+        return user_turn(sentence) + suffix
 
     if args.backend == "openai":
         from grounding.parsing.openai_backend import OpenAIChat
@@ -388,7 +402,8 @@ def main() -> int:
         def generate(chunk):
             outs = server.complete_many([(build_text(r["sentence"]), None)
                                          for r in chunk],
-                                        max_tokens=args.max_tokens, temperature=0.0)
+                                        max_tokens=args.max_tokens, temperature=0.0,
+                                        grammar=grammar)
             return [o.text for o in outs]
     else:
         print(f"Loading {args.model} ...")
@@ -405,10 +420,11 @@ def main() -> int:
         def generate(chunk):
             return batch_generate(
                 model, tok, prompts=[build_prompt(r["sentence"]) for r in chunk],
-                max_tokens=args.max_tokens, sampler=sampler).texts
+                max_tokens=args.max_tokens, sampler=sampler, grammar=grammar).texts
 
     n, n_fail = len(todo), 0
     dropped: Counter = Counter()   # predicates the engine has no encoder for
+    outcomes: Counter = Counter()  # ok / InvalidTree reason
     t0 = time.time()
 
     with open(out_path, "a") as out:
@@ -416,12 +432,14 @@ def main() -> int:
             chunk = todo[start:start + args.batch_size]
             for r, raw in zip(chunk, generate(chunk)):
                 text = raw.split("<|im_end|>")[0]
-                # The legacy parser styles preserve their repairing behaviour
-                # The SFT-v4 path instead matches the supervised program
-                # pipeline: omitted constraints remain omitted, not
-                # being inferred from the sentence at test time
-                json_obj = lower_one(extract_json_objects(text), r["sentence"],
-                                     rel_num, recover=recover, dropped=dropped)
+                # The tree is executed as emitted, or not at all
+                program, json_obj, outcome = parse_generation(text)
+                outcomes[outcome] += 1
+                if json_obj is not None:
+                    # Names the representation has no encoder for are
+                    # dropped at execution (e.g. under --representation baseline)
+                    dropped.update(name for name in relation_names(json_obj)
+                                   if name not in rel_num)
                 if json_obj is None:
                     n_fail += 1
                 # Unparsed rows still written, json_obj null, keeping the full denominator
@@ -429,7 +447,7 @@ def main() -> int:
                        "target_id": r["target_id"],
                        "target_label": r["target_label"],
                        "sentence": r["sentence"], "json_obj": json_obj,
-                       "raw": text}
+                       "raw": text, "program": program, "outcome": outcome}
                 if keyed:
                     row["dataset_idx"] = r["dataset_idx"]
                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -445,12 +463,14 @@ def main() -> int:
 
     meta["written"] = {"rows": len(done_rows(out_path)), "failures_this_run": n_fail,
                        "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    meta["written"]["outcomes_this_run"] = dict(outcomes.most_common())
     meta["output_sha256"] = sha256(out_path)
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
 
     print(f"\nWrote {out_path}  (+ {meta_path.name})")
     print(f"  {n - n_fail}/{n} utterances produced a runnable program "
           f"({n_fail} failures)")
+    print("  outcomes: " + ", ".join(f"{k} {v}" for k, v in outcomes.most_common()))
     if dropped:
         total = sum(dropped.values())
         print(f"  {total} predicate mentions dropped — no encoder in "

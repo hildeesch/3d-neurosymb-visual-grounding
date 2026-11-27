@@ -1,16 +1,20 @@
 """Cue coverage for parser winner selection.
 
-The inventory combines declared v4 predicates, lowering aliases and cleaning
-triggers. Matching is leftmost, longest-first and non-overlapping."""
+The cue inventory (what a sentence explicitly states) combines the previous
+parser's declared v4 predicates, its lowering aliases and cleaning triggers;
+it is the same scanner the v4 winner pools and the error analysis used.
+Matching is leftmost, longest-first and non-overlapping. A tree is credited by
+tree relation name (``TREE_NAME_OF_CUE``), at every level."""
 from __future__ import annotations
 
 import re
 
 from grounding.parsing.cleaning import _ATTR_TRIGGER
 from grounding.parsing.lowering import _PREDICATE_ALIAS
+from grounding.parsing.tree import relation_names
 
-__all__ = ["cue_set", "cue_count", "expressed", "coverage", "predicate_count",
-           "multi_constraint"]
+__all__ = ["cue_set", "cue_count", "TREE_NAME_OF_CUE", "expressed", "coverage",
+           "predicate_count"]
 
 #: The predicates the v4 system prompt declares, in its own spelling.
 V4_PREDICATES = (
@@ -100,27 +104,47 @@ def cue_count(utterance: str) -> int:
     return len(cue_set(utterance))
 
 
-def expressed(program: dict) -> frozenset[str]:
-    """v4 concepts a canonical v4 program encodes, in the same namespace."""
-    return frozenset(
-        {str(a.get("name")) for a in program.get("attributes") or []}
-        | {str(r.get("predicate")) for r in program.get("relations") or []})
+# --------------------------------------------------------------------------
+# Trees
+# --------------------------------------------------------------------------
+
+#: Each cue concept -> the one tree relation name (grounding.parsing.tree.
+#: RELATIONS) for the same encoder. The tree vocabulary has one name per
+#: encoder, so several v4 spellings land on one name; the mapping is the tree
+#: prompt's own "map other wording" rule. tests/test_tree_parser.py checks it
+#: against the extended vocabulary's encoders and against the scanner.
+TREE_NAME_OF_CUE: dict[str, str] = {
+    **dict.fromkeys(("beside", "near", "next to", "within", "in", "inside",
+                     "close", "surrounded by", "around", "attached", "facing"),
+                    "near"),
+    **dict.fromkeys(("far", "opposite", "across"), "far"),
+    **dict.fromkeys(("above", "on top", "on"), "above"),
+    **dict.fromkeys(("below", "under", "beneath"), "below"),
+    "left": "left", "right": "right", "front": "front",
+    "behind": "behind", "back": "behind",
+    "between": "between", "middle": "middle", "center": "middle",
+    "large": "larger", "small": "smaller", "high": "higher", "low": "lower",
+    "on_the_floor": "on the floor", "against_wall": "against wall",
+    "at_corner": "corner", "isolated": "isolated",
+}
 
 
-def coverage(program: dict, utterance: str) -> int:
-    """How many explicitly stated executable cues this program actually says."""
-    return len(cue_set(utterance) & expressed(program))
+def expressed(tree: dict) -> frozenset[str]:
+    """Relation names a tree encodes, at every level.
 
-
-def predicate_count(program: dict) -> int:
-    """Executable predicates the program lowers to.
-
-    Every attribute lowers to a no-anchor relation and every relation to one
-    relation, so the two slots count alike.
+    Unlike a flat v4 program, a tree states an anchor's own relations on the
+    anchor ("the desk with the monitor on it"), so the cue a sentence names may
+    sit below the root.
     """
-    return (len(program.get("attributes") or [])
-            + len(program.get("relations") or []))
+    return frozenset(relation_names(tree))
 
 
-def multi_constraint(program: dict) -> bool:
-    return predicate_count(program) >= 2
+def coverage(tree: dict, utterance: str) -> int:
+    """How many explicitly stated cues the tree says, counted by tree name."""
+    stated = {TREE_NAME_OF_CUE[c] for c in cue_set(utterance)}
+    return len(stated & expressed(tree))
+
+
+def predicate_count(tree: dict) -> int:
+    """Relations the tree executes, at every level."""
+    return len(relation_names(tree))

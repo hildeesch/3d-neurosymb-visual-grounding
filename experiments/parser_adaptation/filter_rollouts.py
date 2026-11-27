@@ -5,9 +5,14 @@ ranks the target is written with its confidence margin. Downstream training-set
 builders apply their own threshold and per-prompt selection policy. Thresholding
 here would mean re-executing the whole pool to move it.
 
-The stored program is the *cleaned* one -- the program that actually earned the
-rank -- so training targets and admission decisions refer to the same object.
-Lowering is used only for scoring; a CleanedProgram is still flat.
+Each distinct tree goes through ``to_executable`` -- the grammar, checked after
+the fact, which rejects and never repairs -- and the checked program is scored.
+The stored ``program`` is the model's tree as emitted: the program that earned
+the rank is the SFT target. Trees outside the grammar are counted by
+InvalidTree reason, per distinct program (``invalid_by_reason``) and per sample
+(``sample_outcomes``, ``sample_invalid_rate``), and the depth of the valid and
+kept trees is reported. The rollouts' ``.meta.json`` says whether the pool was
+decoded under the grammar.
 """
 from __future__ import annotations
 
@@ -17,10 +22,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
+from grounding.parsing.tree import (InvalidTree, depth_of, is_tree_prompt,
+                                    to_executable)
 from grounding.paths import REPO_ROOT
 from grounding.resolution.config import DEFAULT_RESOLVER
 from grounding.resolution import engine
-from grounding.resolution.engine import Scenes, rel_num, score
+from grounding.resolution.engine import Scenes, score
 
 
 def canonical(program: dict) -> str:
@@ -52,8 +59,42 @@ def rank_and_margin(scores, obj_ids: list, target_id) -> tuple[int | None, float
     return rank, margin
 
 
-#: The R=8 teacher pool. Any other --rollouts must name its own --output
-MAIN_POOL = "data/rollouts/nr3d_rollouts_fft_v4.jsonl"
+#: The Qwen3-30B-A3B teacher's pool (teacher_student_grid.rollouts_path("qwen"))
+MAIN_POOL = "data/rollouts/nr3d_rollouts_qwen_tree_v1.jsonl"
+
+
+def default_keepers(rollouts: str, representation: str) -> str:
+    """``.../nr3d_rollouts_<x>.jsonl`` -> ``data/distilled/nr3d_keepers_<x>[_ext].jsonl``."""
+    stem = Path(rollouts).name.removesuffix(".jsonl")
+    if not stem.startswith("nr3d_rollouts_"):
+        raise SystemExit(f"cannot name keepers for {rollouts!r}; pass --output")
+    arm = "_ext" if representation == "extended" else ""
+    return f"data/distilled/nr3d_keepers_{stem.removeprefix('nr3d_rollouts_')}{arm}.jsonl"
+
+
+def rollouts_meta(path: Path) -> dict:
+    """The rollouts' ``.meta.json`` written by generate_rollouts.py."""
+    meta = Path(str(path) + ".meta.json")
+    if not meta.exists():
+        raise SystemExit(f"{path} has no {meta.name}; it was not written by this "
+                         "branch's generate_rollouts.py")
+    recorded = json.loads(meta.read_text())
+    if not is_tree_prompt(recorded.get("prompt")):
+        raise SystemExit(f"{path} was generated under prompt "
+                         f"{recorded.get('prompt')!r}, not a tree prompt")
+    return recorded
+
+
+def sample_outcome(sample: dict) -> str:
+    """Grammar outcome of one sample: ok, no_json or the InvalidTree reason."""
+    parsed = sample.get("parsed")
+    if parsed is None:
+        return "no_json"
+    try:
+        to_executable(parsed)
+    except InvalidTree as e:
+        return e.reason
+    return "ok"
 
 
 def main() -> int:
@@ -61,39 +102,21 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rollouts", default=MAIN_POOL)
     ap.add_argument("--output", default=None,
-                    help="default: nr3d_keepers_fft_v4<arm>.jsonl under "
-                         "data/distilled/, where <arm> is '_ext' for the "
-                         "extended tree and empty for baseline")
+                    help="default: data/distilled/nr3d_keepers_<rollouts "
+                         "name>[_ext].jsonl")
     ap.add_argument("--keep-rank", type=int, default=1,
                     help="keep programs whose target rank is <= this")
-    # Recovery would teach inferred constraints the model did not emit
-    ap.add_argument("--recover", action="store_true", default=False,
-                    help="let clean_program infer constraints the rollout omitted")
-    ap.add_argument("--emit-raw", action="store_true", default=False,
-                    help="store the model's program instead of the cleaned one")
     ap.add_argument("--limit", type=int, default=0, help="0 = every prompt")
     # Acceptance is evidence about one arm, so this must match the arm the student is evaluated in
     ap.add_argument("--representation", dest="representation",
-                    default="baseline",
-                    help="which arm executes the candidates: baseline | extended")
+                    default="extended",
+                    help="which arm executes the candidates: extended (the "
+                         "tree's vocabulary) | baseline")
     args = ap.parse_args()
 
+    meta = rollouts_meta(REPO_ROOT / args.rollouts)
     engine.bind(args.representation)
-
-    # The arm goes in the name, not the sidecar alone, so an alias resolves to its canonical arm
-    if args.output is None:
-        # The default name encodes the arm, not the pool, so other pools must name their output
-        if args.rollouts != MAIN_POOL:
-            raise SystemExit(
-                f"--rollouts is {args.rollouts!r}, not the main pool "
-                f"{MAIN_POOL!r}, and the default --output would overwrite the "
-                "main keeper pool. Pass --output explicitly, e.g. "
-                "data/distilled/nr3d_keepers_fft_v4_recovery_ext.jsonl")
-        arm = "_ext" if engine.bound() == "extended" else ""
-        args.output = f"data/distilled/nr3d_keepers_fft_v4{arm}.jsonl"
-
-    from grounding.parsing import clean_program, lower_program
-    rn = rel_num()
+    args.output = args.output or default_keepers(args.rollouts, engine.bound())
 
     rows = [json.loads(l) for l in open(REPO_ROOT / args.rollouts) if l.strip()]
     if not rows:
@@ -121,7 +144,12 @@ def main() -> int:
 
     scenes = Scenes()
     outcomes: Counter = Counter()
-    cleaning: Counter = Counter()
+    # Grammar outcome per distinct program and per sample, and the depth of
+    # the trees that passed the check / were kept
+    invalid: Counter = Counter()
+    sample_outcomes: Counter = Counter()
+    depth_valid: Counter = Counter()
+    depth_kept: Counter = Counter()
     kept_prompts = 0
     out_path = REPO_ROOT / args.output
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +163,7 @@ def main() -> int:
                 # First sample index per distinct program, for traceability
                 first_seen: dict[str, int] = {}
                 for si, sample in enumerate(row["samples"]):
+                    sample_outcomes[sample_outcome(sample)] += 1
                     parsed = sample.get("parsed")
                     if parsed is None:
                         outcomes["parse_null"] += 1
@@ -145,14 +174,16 @@ def main() -> int:
                         continue
                     first_seen[key] = si
 
+                    # The grammar, checked after the fact: reject, never repair
                     try:
-                        cleaned = clean_program(json.loads(key), utterance, recover=args.recover)
-                    except Exception:   # noqa: BLE001 - a bad parse is data
-                        outcomes["clean_error"] += 1
+                        program = to_executable(parsed)
+                    except InvalidTree as e:
+                        outcomes["invalid_tree"] += 1
+                        invalid[e.reason] += 1
                         continue
-                    was_cleaned = canonical(cleaned) != key
+                    depth_valid[depth_of(program)] += 1
                     try:
-                        ids, scores = score(scenes, scan_id, lower_program(cleaned, rn))
+                        ids, scores = score(scenes, scan_id, program)
                     except Exception:   # noqa: BLE001 - a bad parse is data
                         outcomes["exec_error"] += 1
                         continue
@@ -166,28 +197,27 @@ def main() -> int:
                         continue
 
                     outcomes["kept"] += 1
-                    cleaning["cleaned" if was_cleaned else "untouched"] += 1
+                    depth_kept[depth_of(program)] += 1
                     kept_this = True
-                    record = {
+                    fout.write(json.dumps({
                         "row_idx": row["row_idx"], "scan_id": scan_id,
                         "target_id": target_id, "utterance": utterance,
-                        "program": parsed if args.emit_raw else cleaned,
-                        "cleaned": was_cleaned, "sample_index": si,
+                        "program": parsed, "sample_index": si,
                         "target_rank": rank, "margin": margin,
-                    }
-                    # The preimage is worth keeping only when it differs from the training target
-                    if was_cleaned and not args.emit_raw:
-                        record["raw_program"] = parsed
-                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    }, ensure_ascii=False) + "\n")
                 kept_prompts += kept_this
             scenes.drop(scan_id)
             if n % 25 == 0 or n == len(by_scan):
                 print(f"  {n}/{len(by_scan)} scans, kept {outcomes['kept']}", flush=True)
 
     executed = outcomes["kept"] + outcomes["wrong_rank"] + outcomes["no_target"]
+    n_samples = sum(sample_outcomes.values())
     stats = {
         # The pool a keeper set came from is part of its identity
         "rollouts": args.rollouts,
+        "prompt": meta["prompt"],
+        # How the pool was decoded (generate_rollouts.py); None = unconstrained
+        "grammar": meta.get("grammar"),
         "engine": f"the {engine.bound()} arm (load_one_scene, label_type=gt)",
         "representation": engine.bound(),
         "resolver": {"norm_mode": DEFAULT_RESOLVER.norm_mode,
@@ -200,9 +230,13 @@ def main() -> int:
         "keep_rate_of_executed": outcomes["kept"] / executed if executed else 0.0,
         "prompts_with_at_least_one_keep": kept_prompts,
         "prompt_coverage": kept_prompts / len(rows) if rows else 0.0,
-        "kept_by_cleaning": dict(cleaning),
-        "keep_rank": args.keep_rank, "recover": args.recover,
-        "stored_program": "raw" if args.emit_raw else "cleaned",
+        "keep_rank": args.keep_rank,
+        "invalid_by_reason": dict(invalid.most_common()),
+        "sample_outcomes": dict(sample_outcomes.most_common()),
+        "sample_invalid_rate": (1 - sample_outcomes["ok"] / n_samples
+                                if n_samples else 0.0),
+        "depth_of_valid_distinct": dict(sorted(depth_valid.items())),
+        "depth_of_kept": dict(sorted(depth_kept.items())),
     }
     Path(str(out_path) + ".stats.json").write_text(json.dumps(stats, indent=2))
 
@@ -215,10 +249,13 @@ def main() -> int:
     if executed:
         print(f"Keep rate among executed programs: {outcomes['kept']}/{executed} "
               f"= {stats['keep_rate_of_executed']:.1%}")
-    if outcomes["kept"]:
-        touched = cleaning["cleaned"]
-        print(f"Of the keepers, {touched} ({touched / outcomes['kept']:.1%}) "
-              f"were repaired by clean_program.")
+    mode = "grammar" if meta.get("grammar") else "no grammar"
+    print(f"\n{meta['prompt']}, decoded with {mode}: "
+          f"{stats['sample_invalid_rate']:.1%} of samples outside the grammar")
+    for k, v in invalid.most_common():
+        print(f"  invalid {k:16s} {v}")
+    print(f"  depth of valid distinct trees {stats['depth_of_valid_distinct']}")
+    print(f"  depth of kept trees           {stats['depth_of_kept']}")
     print(f"Wrote {out_path} (+ .stats.json)")
     print("Build training-set variants with build_winner_pool.py and build_uniform_sets.py.")
     return 0

@@ -75,7 +75,9 @@ def comparison_path(out_dir: Path, parses: Path, representation: str | None = No
 
 def checkpoint_result_name(tag: str) -> str:
     """Readable checkpoint name; run identity remains in the result metadata."""
-    return (tag.removeprefix("sft_v4_ext_").replace("__seed", "_seed_")
+    # v4 and tree runs share the readable form; they live in different directories
+    return (tag.removeprefix("sft_v4_ext_").removeprefix("sft_tree_ext_")
+            .replace("__seed", "_seed_")
             .replace("zeroshot", "zero_shot") + ".json")
 
 

@@ -34,25 +34,26 @@ ITERS = 1000
 TRAIN_SEEDS = (0, 1, 2)
 
 # Margin filtering uses the random size-matched control; the uniform arms vary weight only
-MARGIN_FILTERED = "sft_v4_ext_margin_filtered"
-RANDOM_SIZE_MATCHED = "sft_v4_ext_random_size_matched"
+MARGIN_FILTERED = "sft_tree_ext_margin_filtered"
+RANDOM_SIZE_MATCHED = "sft_tree_ext_random_size_matched"
 
 ARMS = [
     MARGIN_FILTERED,
     RANDOM_SIZE_MATCHED,
-    "sft_v4_ext_prompt_uniform",
-    "sft_v4_ext_prompt_uniform_hard150",
-    "sft_v4_ext_prompt_uniform_hard200",
+    "sft_tree_ext_prompt_uniform",
+    "sft_tree_ext_prompt_uniform_hard150",
+    "sft_tree_ext_prompt_uniform_hard200",
 ]
 
 MODEL = STUDENTS[DEFAULT_STUDENT].hf
+#: The v4 students' LoRA YAML, unchanged: the parser is the only difference
 CONFIG = "lora_config_sft_v4_ext.yaml"
 BATCH_SIZE = 4
 SAVE_EVERY = 200
 STEPS_PER_EVAL = 100
 STEPS_PER_REPORT = 10
 VAL_BATCHES = 25
-PROJECT = "nr3d-sft-v4-ext"
+PROJECT = "nr3d-sft-tree-ext"
 
 
 def train_rows(name: str, sets_dir: Path) -> int:
@@ -63,15 +64,19 @@ def train_rows(name: str, sets_dir: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
-def schedule(sets_dir: Path, iters: int = ITERS) -> list[dict]:
+def schedule(sets_dir: Path, iters: int = ITERS, arms=None) -> list[dict]:
     """One entry per (arm, seed). Every run gets the same update budget.
 
     `epochs` is still reported, because it is no longer held constant and so
     becomes a fact about each arm worth reading: at a fixed budget a larger set
     is covered less. It is a diagnostic here, not a control.
+
+    ``arms`` (default: all of ARMS) limits the plan, and the train.jsonl check,
+    to those arms: a sets directory built with ``build_uniform_sets.py --only``
+    (another teacher's, or the tree track's) holds one arm, not five.
     """
     out = []
-    for a in ARMS:
+    for a in arms or ARMS:
         rows = train_rows(a, sets_dir)
         for seed in TRAIN_SEEDS:
             out.append({"name": a, "seed": seed, "rows": rows, "iters": iters,
@@ -151,9 +156,9 @@ def main() -> int:
                     help="updates every run receives. Fixed across arms: the "
                          "optimization budget is the controlled quantity")
     ap.add_argument("--sets", type=Path,
-                    default=REPO / "data/training_sets_zscore_sigmoid")
-    ap.add_argument("--adapters", type=Path, default=REPO / "artifacts/adapters")
-    ap.add_argument("--logs", type=Path, default=REPO / "runs/logs")
+                    default=REPO / "data/training_sets_tree_v1_qwen")
+    ap.add_argument("--adapters", type=Path, default=REPO / "artifacts/adapters_tree_v1")
+    ap.add_argument("--logs", type=Path, default=REPO / "runs/logs_tree_v1")
     ap.add_argument("--student", choices=sorted(STUDENTS), default=None,
                     help="base model: qwen3 = Qwen3-1.7B (default), coder = "
                          "Qwen2.5-Coder-1.5B-Instruct")
@@ -174,12 +179,12 @@ def main() -> int:
     args = ap.parse_args()
     model = args.model or STUDENTS[args.student or DEFAULT_STUDENT].hf
 
-    plan = schedule(args.sets, args.iters)
     if args.only:
-        unknown = set(args.only) - {a["name"] for a in plan}
+        unknown = set(args.only) - set(ARMS)
         if unknown:
             sys.exit(f"unknown arm(s): {sorted(unknown)}")
-        plan = [a for a in plan if a["name"] in set(args.only)]
+    plan = schedule(args.sets, args.iters,
+                    [a for a in ARMS if a in set(args.only)] if args.only else None)
     if args.seeds:
         plan = [a for a in plan if a["seed"] in set(args.seeds)]
 

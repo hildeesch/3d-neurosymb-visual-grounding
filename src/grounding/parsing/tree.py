@@ -1,8 +1,9 @@
-"""Tree parser track: the model writes the executable program tree directly.
+"""The parser: the model writes the executable program tree directly.
 
-The v4 track asks for a flat JSON, repairs it with ``clean_program`` (regex
-rules on the sentence) and turns it into a tree with ``lower_program`` (alias
-table, depth cap). This track replaces all three with one fixed grammar:
+The previous (v4) parser asked for a flat JSON, repaired it with
+``clean_program`` (regex rules on the sentence) and turned it into a tree with
+``lower_program`` (alias table, depth cap). This parser replaces all three with
+one fixed grammar:
 
 * the prompt asks for the executable schema itself (``category`` / ``color`` /
   ``relations`` -> ``relation_name`` / ``negative`` / ``rank`` / ``objects``),
@@ -20,6 +21,7 @@ what gets executed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -30,7 +32,9 @@ from grounding.parsing.parse import extract_json_objects
 __all__ = [
     "RelationSpec", "RELATIONS", "COLOURS", "MAX_DEPTH", "TREE_PROMPTS",
     "SYSTEM_PROMPT_TREE_V1", "InvalidTree", "gbnf", "to_executable",
-    "parse_generation", "dumps", "depth_of",
+    "parse_generation", "dumps", "depth_of", "is_tree_prompt", "grammar_for",
+    "grammar_record", "in_layout", "relation_names", "size", "add_grammar_args",
+    "DEFAULT_PROMPT", "user_turn",
 ]
 
 
@@ -176,9 +180,19 @@ Output:
 {"category": "chair", "color": null, "relations": [{"relation_name": "far", "negative": false, "rank": 1, "objects": [{"category": "desk", "color": null, "relations": [{"relation_name": "below", "negative": false, "rank": null, "objects": [{"category": "monitor", "color": null, "relations": []}]}]}]}]}
 """
 
-#: Prompt registry for this track. Kept separate from parsing.prompt.PROMPTS so
-#: the frozen v2-v5 literals and their cached supervision are untouched.
+#: System prompts of the parser, by id. Frozen literals: a new prompt gets a new
+#: id, so cached supervision always names the prompt it was generated under.
 TREE_PROMPTS = {"tree_v1": SYSTEM_PROMPT_TREE_V1}
+DEFAULT_PROMPT = "tree_v1"
+
+
+def user_turn(utterance: str) -> str:
+    """The user turn of every parser call: rollouts, SFT rows and test parses.
+
+    The same string the v4 parser used, so the prompt id is the only thing
+    that differs between the two parsers' inputs.
+    """
+    return f"Sentence: {utterance}\n\nParsed JSON:"
 
 
 # --------------------------------------------------------------------------
@@ -348,3 +362,87 @@ def depth_of(node: dict) -> int:
     """Node levels in an executable or model tree (target alone = 1)."""
     child = [depth_of(o) for r in node.get("relations") or [] for o in r.get("objects") or []]
     return 1 + max(child, default=0)
+
+
+# --------------------------------------------------------------------------
+# Track plumbing: which prompts are tree prompts, the grammar a run decodes
+# under, and the program statistics the training-set builders read
+# --------------------------------------------------------------------------
+
+def is_tree_prompt(name: str | None) -> bool:
+    """True for a prompt id of this track (``tree_v1``), False for v2-v5."""
+    return name in TREE_PROMPTS
+
+
+def grammar_for(prompt: str | None, enabled: bool = True,
+                max_depth: int = MAX_DEPTH) -> str | None:
+    """The GBNF a parser decodes under, or None for unconstrained decoding.
+
+    Only the tree prompts have a grammar; ``enabled=False`` is the
+    ``--no-grammar`` ablation (same prompt, free decoding, same post-hoc check).
+    """
+    return gbnf(max_depth) if enabled and is_tree_prompt(prompt) else None
+
+
+def add_grammar_args(ap) -> None:
+    """The ``--no-grammar`` switch shared by the generators."""
+    ap.add_argument("--no-grammar", action="store_true",
+                    help="tree prompts: decode without the grammar (ablation). "
+                         "The output is still checked by to_executable, never "
+                         "repaired. No effect on v2-v5 prompts, which have no "
+                         "grammar")
+
+
+def grammar_record(grammar: str | None) -> dict | None:
+    """What a ``.meta.json`` records about the grammar; None when unconstrained.
+
+    The hash is over the GBNF text itself, so any change to the vocabulary,
+    the layout or the depth cap shows up as a different grammar on resume.
+    """
+    if grammar is None:
+        return None
+    return {"format": "gbnf",
+            "sha256": hashlib.sha256(grammar.encode()).hexdigest()}
+
+
+def in_layout(tree: Any) -> bool:
+    """True when every node and relation has its keys in schema order.
+
+    :func:`to_executable` compares key *sets*; the grammar also fixes their
+    order. An unconstrained (``--no-grammar``) generation can be valid yet out
+    of order, and as an SFT target it would teach a layout the grammar-
+    constrained student cannot emit. Callers reject such trees; nothing here
+    reorders them.
+    """
+    if not isinstance(tree, dict) or tuple(tree) != _NODE_KEYS:
+        return False
+    for rel in tree.get("relations") or []:
+        if not isinstance(rel, dict) or tuple(rel) != _RELATION_KEYS:
+            return False
+        if not all(in_layout(o) for o in rel.get("objects") or []):
+            return False
+    return True
+
+
+def relation_names(node: dict) -> list[str]:
+    """Relation names at every level of a model or executable tree."""
+    out = []
+    for rel in node.get("relations") or []:
+        out.append(rel["relation_name"])
+        for o in rel.get("objects") or []:
+            out.extend(relation_names(o))
+    return out
+
+
+def size(node: dict) -> int:
+    """Program complexity for the minimality tie-break: relations + objects.
+
+    The counterpart of the v4 parser's size (attributes + relations + anchors):
+    an object-less relation counts 1, a relation with k objects 1 + k, at
+    every level.
+    """
+    total = 0
+    for rel in node.get("relations") or []:
+        objects = rel.get("objects") or []
+        total += 1 + len(objects) + sum(size(o) for o in objects)
+    return total

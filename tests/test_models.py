@@ -65,10 +65,12 @@ def test_resolve_template_tokenizer_fills_args_and_exits_on_mismatch():
 def test_generate_rollouts_default_output():
     gr = pytest.importorskip("experiments.parser_adaptation.generate_rollouts")
     from pathlib import Path
-    assert gr.default_output("qwen_coder", "llamacpp", "x.gguf", "v4") == \
-        Path("data/rollouts/nr3d_rollouts_qwen_coder_v4.jsonl")
-    # the thesis teacher keeps the historical names
-    assert gr.default_output("qwen", "hf", QWEN, "v4") == \
-        Path("data/rollouts/nr3d_rollouts_v4.jsonl")
-    assert gr.default_output(None, "llamacpp", "Qwen3-30B-A3B-Q4_K_M.gguf", "v4") == \
-        Path("data/rollouts/nr3d_rollouts_v4_Qwen3-30B-A3B-Q4_K_M.jsonl")
+    assert gr.default_output("qwen_coder", "llamacpp", "x.gguf") == \
+        Path("data/rollouts/nr3d_rollouts_qwen_coder_tree_v1.jsonl")
+    assert gr.default_output("qwen", "hf", QWEN) == \
+        Path("data/rollouts/nr3d_rollouts_qwen_tree_v1.jsonl")
+    assert gr.default_output(None, "llamacpp", "Qwen3-30B-A3B-Q4_K_M.gguf") == \
+        Path("data/rollouts/nr3d_rollouts_Qwen3-30B-A3B-Q4_K_M_tree_v1.jsonl")
+    # the grammar ablation never shares a file with the constrained run
+    assert gr.default_output("qwen", "llamacpp", "x.gguf", constrained=False) == \
+        Path("data/rollouts/nr3d_rollouts_qwen_tree_v1_nogrammar.jsonl")

@@ -7,9 +7,12 @@ resolver standardises every relation score and squashes it with a sigmoid
 LaSP exactly -- tests/test_executor_equivalence.py checks this -- so the
 executor factor below isolates that one change.
 
-Parser arms are the distillation grid (experiments/parser_adaptation/
-teacher_student_grid.py): every student model trained on every teacher's
-winners, plus every teacher parsing zero-shot.
+Parser arms are the distillation grid of the tree parser (experiments/
+parser_adaptation/teacher_student_grid.py): every student model trained on
+every teacher's winners, plus every teacher parsing zero-shot, all under the
+tree prompt and grammar. ``parses_for(arm, constrained=False)`` is the same arm
+decoded without the grammar (the grammar ablation); GPT-4o cannot decode under
+a grammar, so its arm is always the unconstrained parse.
 
     student                        Qwen3-1.7B         <- Qwen3-30B-A3B (full system)
     student_coder                  Qwen2.5-Coder-1.5B <- Qwen3-30B-A3B
@@ -24,14 +27,14 @@ the teacher x student grid is a factorial design of its own.
 
 What each level holds fixed:
 
-* parser: the parses file. Everything else is identical, including lowering
-  against the extended vocabulary (the student's own lowering), so the parser
-  factor changes the model only.
+* parser: the parses file. Everything else is identical -- every arm's
+  ``json_obj`` is ``to_executable`` of its tree -- so the parser factor
+  changes the model only.
 * representation: which encoders build the feature tensor and which predicate
   table the resolver accepts. ``lasp`` is upstream LaSP's table and encoders
   (the baseline tree): no colour, isolation, thesis wall encoder,
-  smallest/lowest, or ordinal rank. Programs are not re-lowered, so a
-  predicate the LaSP table lacks is dropped at execution, as in LaSP.
+  smallest/lowest, or ordinal rank. Programs are not rewritten, so a
+  relation the LaSP table lacks is dropped at execution, as in LaSP.
 * executor: per-relation normalisation, thesis vs LaSP. Colour composition
   (product) and rank stay with the representation they belong to.
 
@@ -55,7 +58,8 @@ __all__ = ["ParserArm", "PARSER_ARMS", "PARSERS", "TEACHER_PARSERS",
            "STUDENT_PARSERS", "DEFAULT_PARSERS", "GRID_TEACHERS", "GRID_STUDENTS",
            "ZERO_SHOT", "REPRESENTATION_LEVELS", "EXECUTOR_LEVELS", "FULL",
            "FACTORS", "PARSER_ATTRIBUTES", "Cell", "cells", "cell_command",
-           "default_parses", "teacher_parse_command", "student_parse_hint",
+           "default_parses", "parses_for", "teacher_parse_command",
+           "student_parse_hint",
            "grid_arms", "teacher_arm", "model_label"]
 
 
@@ -85,8 +89,8 @@ def _arms() -> dict[str, ParserArm]:
         arms[name] = ParserArm(name, key, None, f"{model.label} (zero-shot)",
                                grid.teacher_parses_path(key))
     arms["teacher_gpt4o"] = ParserArm("teacher_gpt4o", "gpt4o", None,
-                                      "GPT-4o (zero-shot)",
-                                      grid.teacher_parses_path("gpt4o"))
+                                      "GPT-4o (zero-shot, no grammar)",
+                                      grid.teacher_parses_path("gpt4o", False))
     return arms
 
 
@@ -206,23 +210,35 @@ def default_parses(parser: str) -> str:
     return PARSERS[parser]
 
 
+def parses_for(parser: str, constrained: bool = True) -> str:
+    """Default test parses of an arm, with or without the grammar."""
+    if parser in STUDENT_PARSERS:
+        student, teacher = STUDENT_PARSERS[parser]
+        return grid.Pair(student, teacher).parses(constrained)
+    teacher = TEACHER_PARSERS[parser]
+    # The OpenAI API has no grammar: GPT-4o's arm is always unconstrained
+    return grid.teacher_parses_path(teacher, constrained and teacher != "gpt4o")
+
+
 def student_parse_hint(parser: str) -> str:
     """Where a missing student arm's parses come from (training environment)."""
     student, teacher = STUDENT_PARSERS[parser]
-    if grid.is_reference(student, teacher):
-        return ("the maintained student: python -m experiments.parser_adaptation."
-                "parse_split --representation extended --style sft --adapter "
-                f"artifacts/adapters/{grid.ARM}__seed2 --out {PARSERS[parser]}")
     return ("python -m experiments.parser_adaptation.teacher_student_grid plan "
             f"--students {student} --teachers {teacher}   # then `run` the steps it lists")
 
 
 def teacher_parse_command(parser: str, rows: str = "data/corpora/nr3d_test.csv",
-                          out: str | None = None) -> list[str]:
-    """The parse_split invocation (training environment) for a teacher arm."""
+                          out: str | None = None, constrained: bool = True) -> list[str]:
+    """The parse_split invocation (training environment) for a teacher arm.
+
+    Grammar-constrained unless ``constrained`` is False (``--no-grammar``);
+    GPT-4o is always unconstrained.
+    """
+    teacher = TEACHER_PARSERS[parser]
     cmd = ["python", "-m", "experiments.parser_adaptation.parse_split",
-           "--representation", "extended", "--teacher", TEACHER_PARSERS[parser],
-           "--rows", rows]
+           "--representation", "extended", "--teacher", teacher, "--rows", rows]
+    if not constrained or teacher == "gpt4o":
+        cmd.append("--no-grammar")
     if out:
         cmd += ["--out", out]
     return cmd

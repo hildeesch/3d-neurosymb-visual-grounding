@@ -17,6 +17,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from grounding.parsing.tree import DEFAULT_PROMPT
 from grounding.paths import RESULTS_STAGE3
 from grounding.resolution.config import FROZEN_RESOLVER, shared_resolver
 
@@ -27,9 +28,9 @@ METRICS = ("overall", "hard", "easy")
 ROW_FIELDS = {"top1": "model", "expected": "model_expected"}
 REFERENCE = ("qwen3_1p7b_zeroshot",)
 DOSES = (
-    ("sft_v4_ext_prompt_uniform", "1.0"),
-    ("sft_v4_ext_prompt_uniform_hard150", "1.5"),
-    ("sft_v4_ext_prompt_uniform_hard200", "2.0"),
+    ("sft_tree_ext_prompt_uniform", "1.0"),
+    ("sft_tree_ext_prompt_uniform_hard150", "1.5"),
+    ("sft_tree_ext_prompt_uniform_hard200", "2.0"),
 )
 
 
@@ -64,7 +65,7 @@ def collect_runs(results_dir: Path, field: str = "model") -> dict[str, dict[int,
     runs: dict[str, dict[int, dict]] = defaultdict(dict)
     for path in sorted(results_dir.glob("*_seed_*.json")):
         if match := RUN_RE.match(path.name):
-            runs["sft_v4_ext_" + match["arm"]][int(match["seed"])] = load_run(path, field)
+            runs["sft_tree_ext_" + match["arm"]][int(match["seed"])] = load_run(path, field)
     if not runs:
         sys.exit(f"no <arm>_seed_<k>.json under {results_dir}")
     return runs
@@ -178,7 +179,7 @@ def main() -> int:
     args = parse_args()
     if args.results is None:
         args.results = (RESULTS_STAGE3.parent / "expected_top1"
-                        if args.metric == "expected" else RESULTS_STAGE3)
+                        if args.metric == "expected" else RESULTS_STAGE3) / DEFAULT_PROMPT
     runs = collect_runs(args.results, ROW_FIELDS[args.metric])
     resolver = shared_resolver(
         {f"{arm}__seed{seed}": run["resolver"]

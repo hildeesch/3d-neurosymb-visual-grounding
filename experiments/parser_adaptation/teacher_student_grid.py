@@ -3,43 +3,47 @@
 
 Two teachers x two students (grounding.parsing.models):
 
-    teachers  qwen        Qwen3-30B-A3B                  (thesis teacher)
+    teachers  qwen        Qwen3-30B-A3B
               qwen_coder  Qwen3-Coder-30B-A3B-Instruct
-    students  qwen3       Qwen3-1.7B                     (thesis student)
+    students  qwen3       Qwen3-1.7B
               coder       Qwen2.5-Coder-1.5B-Instruct
 
-Each student is trained on each teacher's winners with the thesis recipe and
-nothing else changed: the maintained arm (``sft_v4_ext_random_size_matched``,
-3908 prompts x 2 rows), the shared LoRA YAML, 1000 updates, seeds 0-2, the seed
+The parser is the grammar-constrained tree parser (grounding.parsing.tree,
+prompt ``tree_v1``). Each student is trained on each teacher's winners with one
+recipe: the size-matched arm (``sft_tree_ext_random_size_matched``, 3908
+prompts x 2 rows), the shared LoRA YAML, 1000 updates, seeds 0-2, the seed
 chosen on dev by select_adapter.py, then a greedy test parse. Together with the
 two zero-shot teachers that gives the six parser arms of the ablation
 (experiments/ablation): ``student`` (qwen3 <- qwen, the full system),
 ``student_coder``, ``student_from_qwen_coder``, ``student_coder_from_qwen_coder``,
-``teacher_qwen`` and ``teacher_qwen_coder``.
+``teacher_qwen`` and ``teacher_qwen_coder``. Every test parse is also written
+without the grammar (``_nogrammar``), for the grammar ablation.
 
-The reference pair (qwen3 <- qwen) is the maintained student: its parses file
-is used as it is and no step is re-run for it.
+Every output has a tree name (``..._tree_v1...``) and its own directory, so
+nothing here overwrites the v4 parser's artifacts.
 
 Steps, in order (``plan`` prints them with their status; ``run`` executes the
 ones whose outputs are missing, in this environment, stopping at the first
 failure):
 
-    teacher  rollouts  R=8 rollouts on the frozen 8750 train prompts (llama-server
-                       must serve that teacher's GGUF; training env)
-             filter    filter_rollouts.py through the extended arm
-             winners   build_winner_pool.py
-             sets      build_uniform_sets.py --only random_size_matched
-             zeroshot  zero-shot test parse (llama-server; training env)
-    student  train     train_sft_arms.py, three seeds
-             dev       score_checkpoint.py --split dev --n 0, per seed
-             select    select_adapter.py over the three seeds
-             parse     parse_split.py --style sft with the selected adapter
+    teacher  rollouts            R=8 rollouts on the frozen 8750 train prompts
+                                 (llama-server must serve that teacher's GGUF)
+             filter              filter_rollouts.py through the extended arm
+             winners             build_winner_pool.py
+             sets                build_uniform_sets.py --only random_size_matched
+             zeroshot            zero-shot test parse (llama-server)
+             zeroshot_nogrammar  the same without the grammar (llama-server)
+    student  train               train_sft_arms.py, three seeds
+             dev                 score_checkpoint.py --split dev --n 0, per seed
+             select              select_adapter.py over the three seeds
+             parse               parse_split.py --style sft with the selected adapter
+             parse_nogrammar     the same without the grammar
 
     python -m experiments.parser_adaptation.teacher_student_grid plan
     python -m experiments.parser_adaptation.teacher_student_grid run \\
-        --teachers qwen_coder --steps filter winners sets
+        --teachers qwen --steps rollouts zeroshot zeroshot_nogrammar
     python -m experiments.parser_adaptation.teacher_student_grid run \\
-        --students coder --steps train dev select parse
+        --steps filter winners sets train dev select parse parse_nogrammar
 """
 
 from __future__ import annotations
@@ -54,25 +58,27 @@ from pathlib import Path
 
 from grounding.parsing.models import (DEFAULT_STUDENT, DEFAULT_TEACHER,
                                       STUDENTS, TEACHERS)
+from grounding.parsing.tree import DEFAULT_PROMPT
 from grounding.paths import REPO_ROOT
+from grounding.resolution.artifacts import checkpoint_result_name
 
-#: The maintained training arm: every pair is trained on it
-ARM = "sft_v4_ext_random_size_matched"
+#: The training arm every pair is trained on
+ARM = "sft_tree_ext_random_size_matched"
+#: The parser's system prompt; also the tag in every file name
+PROMPT = DEFAULT_PROMPT
 SEEDS = (0, 1, 2)
 #: generate_rollouts.load_rows prefix the frozen R=8 pool was drawn from
 ROLLOUT_PROMPTS = 8750
 TEST_ROWS = "data/corpora/nr3d_test.csv"
 
-TEACHER_STEPS = ("rollouts", "filter", "winners", "sets", "zeroshot")
-STUDENT_STEPS = ("train", "dev", "select", "parse")
+TEACHER_STEPS = ("rollouts", "filter", "winners", "sets", "zeroshot",
+                 "zeroshot_nogrammar")
+STUDENT_STEPS = ("train", "dev", "select", "parse", "parse_nogrammar")
 STEPS = TEACHER_STEPS + STUDENT_STEPS
 
-#: The maintained student's test parses (seed 2, selected on dev)
-REFERENCE_PARSES = "data/parses/test/nr3d_test_sft_v4_ext_random_size_matched__seed2.jsonl"
 
-
-def is_reference(student: str, teacher: str) -> bool:
-    return student == DEFAULT_STUDENT and teacher == DEFAULT_TEACHER
+def _tag(constrained: bool = True) -> str:
+    return PROMPT + ("" if constrained else "_nogrammar")
 
 
 def parser_name(student: str, teacher: str) -> str:
@@ -92,30 +98,24 @@ def teacher_parser_name(teacher: str) -> str:
 # --- paths (repo-relative strings) ----------------------------------------
 
 def rollouts_path(teacher: str) -> str:
-    if teacher == DEFAULT_TEACHER:
-        return "data/rollouts/nr3d_rollouts_fft_v4.jsonl"
-    return f"data/rollouts/nr3d_rollouts_{teacher}_v4.jsonl"
+    return f"data/rollouts/nr3d_rollouts_{teacher}_{PROMPT}.jsonl"
 
 
 def keepers_path(teacher: str) -> str:
-    tag = "fft" if teacher == DEFAULT_TEACHER else teacher
-    return f"data/distilled/nr3d_keepers_{tag}_v4_ext.jsonl"
+    return f"data/distilled/nr3d_keepers_{teacher}_{PROMPT}_ext.jsonl"
 
 
 def winners_path(teacher: str) -> str:
-    tag = "fft" if teacher == DEFAULT_TEACHER else teacher
-    return f"data/distilled/nr3d_winners_{tag}_v4_ext.jsonl"
+    return f"data/distilled/nr3d_winners_{teacher}_{PROMPT}_ext.jsonl"
 
 
 def sets_path(teacher: str) -> str:
-    if teacher == DEFAULT_TEACHER:
-        return "data/training_sets_zscore_sigmoid"
-    return f"data/training_sets_{teacher}"
+    return f"data/training_sets_{PROMPT}_{teacher}"
 
 
-def teacher_parses_path(teacher: str) -> str:
-    """What ``parse_split --teacher <t>`` writes by default for the test rows."""
-    return f"data/parses/test/nr3d_test_teacher_{teacher}_v4_ext.jsonl"
+def teacher_parses_path(teacher: str, constrained: bool = True) -> str:
+    """What ``parse_split --teacher <t> [--no-grammar]`` writes for the test rows."""
+    return f"data/parses/test/nr3d_test_teacher_{teacher}_{_tag(constrained)}_ext.jsonl"
 
 
 @dataclass(frozen=True)
@@ -132,10 +132,6 @@ class Pair:
         return parser_name(self.student, self.teacher)
 
     @property
-    def reference(self) -> bool:
-        return is_reference(self.student, self.teacher)
-
-    @property
     def label(self) -> str:
         return f"{STUDENTS[self.student].label} <- {TEACHERS[self.teacher].label}"
 
@@ -145,32 +141,32 @@ class Pair:
 
     @property
     def adapters(self) -> str:
-        return "artifacts/adapters" if self.reference else f"artifacts/adapters_{self.tag}"
+        return f"artifacts/adapters_{PROMPT}_{self.tag}"
 
     @property
     def logs(self) -> str:
-        return "runs/logs" if self.reference else f"runs/logs_{self.tag}"
+        return f"runs/logs_{PROMPT}_{self.tag}"
 
     @property
     def dev_dir(self) -> str:
-        return f"artifacts/results/parser_adaptation/dev/grid/{self.tag}"
+        return f"artifacts/results/parser_adaptation/dev/grid_{PROMPT}/{self.tag}"
 
     def run(self, seed: int) -> str:
         return f"{ARM}__seed{seed}"
 
     def dev_result(self, seed: int) -> str:
-        # score_checkpoint's own naming (checkpoint_result_name)
-        return f"{self.dev_dir}/{ARM.removeprefix('sft_v4_ext_')}_seed_{seed}.json"
+        return f"{self.dev_dir}/{checkpoint_result_name(self.run(seed))}"
 
     @property
     def selection(self) -> str:
         return f"{self.dev_dir}/selection.json"
 
+    def parses(self, constrained: bool = True) -> str:
+        return f"data/parses/test/nr3d_test_{self.name}_{_tag(constrained)}_ext.jsonl"
+
     @property
     def test_parses(self) -> str:
-        if self.reference:
-            return REFERENCE_PARSES
-        return f"data/parses/test/nr3d_test_{self.name}_v4_ext.jsonl"
+        return self.parses()
 
 
 def pairs(students=None, teachers=None) -> list[Pair]:
@@ -237,20 +233,15 @@ def teacher_steps(teacher: str) -> list[Step]:
     r, k, w, s = (rollouts_path(teacher), keepers_path(teacher),
                   winners_path(teacher), sets_path(teacher))
     train_set = f"{s}/{ARM}/train.jsonl"
-    foreign = [] if teacher == DEFAULT_TEACHER else ["--foreign-pool"]
     # rollouts -> keepers -> winners -> training set: a step is done once its
-    # output or any later one exists (the thesis teacher's training set may be
-    # present without the intermediate pools)
+    # output or any later one exists
     chain = [_has_rows(x) for x in (r, k, w, train_set)]
     done = [any(chain[i:]) for i in range(len(chain))]
     hint = llama_server_hint(teacher)
-    if teacher == DEFAULT_TEACHER:
-        hint = ("the frozen thesis pool; regenerating it replaces the thesis "
-                "teacher's rollouts. " + hint)
-    return [
+    steps = [
         Step("rollouts", teacher,
              _py("generate_rollouts", "--teacher", teacher, "--backend", "llamacpp",
-                 "--prompt", "v4", "--limit", ROLLOUT_PROMPTS, "--n-samples", 8,
+                 "--prompt", PROMPT, "--limit", ROLLOUT_PROMPTS, "--n-samples", 8,
                  "--temp", 0.7, "--max-tokens", 320, "--seed", 0, "--output", r),
              done[0], hint),
         Step("filter", teacher,
@@ -259,21 +250,20 @@ def teacher_steps(teacher: str) -> list[Step]:
         Step("winners", teacher,
              _py("build_winner_pool", "--keepers", k, "--output", w), done[2]),
         Step("sets", teacher,
-             _py("build_uniform_sets", "--pool", w, "--out", s, "--only", ARM,
-                 *foreign), done[3]),
-        Step("zeroshot", teacher,
-             _py("parse_split", "--representation", "extended", "--teacher", teacher,
-                 "--rows", TEST_ROWS, "--out", teacher_parses_path(teacher)),
-             parses_complete(teacher_parses_path(teacher)),
-             llama_server_hint(teacher)),
+             _py("build_uniform_sets", "--pool", w, "--out", s, "--only", ARM),
+             done[3]),
     ]
+    for step, constrained in (("zeroshot", True), ("zeroshot_nogrammar", False)):
+        out = teacher_parses_path(teacher, constrained)
+        argv = _py("parse_split", "--representation", "extended", "--teacher", teacher,
+                   "--prompt", PROMPT, "--rows", TEST_ROWS, "--out", out)
+        if not constrained:
+            argv.append("--no-grammar")
+        steps.append(Step(step, teacher, argv, parses_complete(out), hint))
+    return steps
 
 
 def student_steps(pair: Pair, wandb: bool = False) -> list[Step]:
-    if pair.reference:
-        return [Step(step, pair.tag, None, True,
-                     f"reference pair: the maintained student ({REFERENCE_PARSES})")
-                for step in STUDENT_STEPS]
     # Relative paths: every command runs from the repository root
     train = _py("train_sft_arms", "--student", pair.student,
                 "--sets", sets_path(pair.teacher),
@@ -286,7 +276,8 @@ def student_steps(pair: Pair, wandb: bool = False) -> list[Step]:
     for seed in SEEDS:
         steps.append(Step(
             "dev", pair.tag,
-            _py("score_checkpoint", "--split", "dev", "--n", 0, "--model", pair.model,
+            _py("score_checkpoint", "--split", "dev", "--n", 0, "--prompt", PROMPT,
+                "--model", pair.model,
                 "--adapter", f"{pair.adapters}/{pair.run(seed)}",
                 "--out", pair.dev_result(seed)),
             _p(pair.dev_result(seed)).exists(), f"seed {seed}"))
@@ -296,12 +287,18 @@ def student_steps(pair: Pair, wandb: bool = False) -> list[Step]:
             "--out", pair.selection),
         _p(pair.selection).exists()))
     chosen = selected_run(pair)
-    parse = (_py("parse_split", "--representation", "extended", "--style", "sft",
-                 "--student", pair.student, "--adapter", f"{pair.adapters}/{chosen}",
-                 "--rows", TEST_ROWS, "--out", pair.test_parses)
-             if chosen else None)
-    steps.append(Step("parse", pair.tag, parse, parses_complete(pair.test_parses),
-                      "" if chosen else f"after select (reads {pair.selection})"))
+    for step, constrained in (("parse", True), ("parse_nogrammar", False)):
+        out = pair.parses(constrained)
+        argv = None
+        if chosen:
+            argv = _py("parse_split", "--representation", "extended", "--style", "sft",
+                       "--prompt", PROMPT, "--student", pair.student,
+                       "--adapter", f"{pair.adapters}/{chosen}",
+                       "--rows", TEST_ROWS, "--out", out)
+            if not constrained:
+                argv.append("--no-grammar")
+        steps.append(Step(step, pair.tag, argv, parses_complete(out),
+                          "" if chosen else f"after select (reads {pair.selection})"))
     return steps
 
 
@@ -331,11 +328,12 @@ def cmd_plan(args) -> int:
         if args.todo and s.done:
             continue
         mark = "done" if s.done else ("blocked" if s.argv is None else "todo")
-        print(f"[{mark:>7}] {s.step:<8} {s.who:<24} {s.note}")
+        print(f"[{mark:>7}] {s.step:<18} {s.who:<20} {s.note}")
         if s.argv and not s.done:
             print(f"          {s.line()}")
     print("\nthen, in the evaluation environment:\n"
-          "  python -m experiments.ablation plan\n  python -m experiments.ablation run")
+          "  python -m experiments.ablation run\n"
+          "  python -m experiments.ablation run --no-grammar")
     return 0
 
 

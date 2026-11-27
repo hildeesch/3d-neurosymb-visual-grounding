@@ -4,7 +4,14 @@
 The resolver reads FROZEN_RESOLVER and records its actual settings. Selection
 credits targets tied at the top; headline evaluate.py/compare_baseline.py use
 the declared tie-break policy. These are different evaluation protocols.
-``--expected-top1`` also records tie-aware credit: 1/k for a k-way top tie."""
+``--expected-top1`` also records tie-aware credit: 1/k for a k-way top tie.
+
+Generation is constrained to the tree grammar (xgrammar; ``--no-grammar`` for
+the ablation), and each generation is executed as ``to_executable(tree)``. A
+tree outside the grammar scores as a miss; its InvalidTree reason is kept per
+row (``outcome``) and counted in the summary. ``--rescore`` reads the
+generations of this script or of parse_split.py and scores them the same way.
+Default outputs go to a ``tree_v1`` directory beside the v4 parser's results."""
 from __future__ import annotations
 
 import argparse
@@ -13,19 +20,21 @@ import json
 import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 
-from grounding.parsing import PROMPTS
+from grounding.parsing.tree import (DEFAULT_PROMPT, TREE_PROMPTS,
+                                    add_grammar_args, grammar_for,
+                                    grammar_record, is_tree_prompt,
+                                    parse_generation, user_turn)
 from grounding.parsing.generation import (add_model_args, batch_generate,
                                           encode_chat, free_memory, load_model)
-from grounding.parsing.training_set import user_turn
 from grounding.resolution.config import resolver_metadata
 from grounding.paths import CORPORA, REPO_ROOT, RESULTS_FINAL, RESULTS_STAGE3, ROLLOUTS
 from grounding.paths import SPLITS_PATH as SPLITS
 from grounding.resolution import engine
-from grounding.resolution.engine import (Scenes, rel_num, score,
-                                         target_rank)
+from grounding.resolution.engine import Scenes, score, target_rank
 from grounding.resolution.ranking import expected_rank
 
 def _default_out(split: str, tag: str, expected_top1: bool = False) -> str:
@@ -36,6 +45,7 @@ def _default_out(split: str, tag: str, expected_top1: bool = False) -> str:
         directory = directory.parent / "expected_top1"
     if split != "dev":
         directory = directory / "checkpoint_scoring" / split
+    directory = directory / DEFAULT_PROMPT
     return str((directory / checkpoint_result_name(tag)).relative_to(REPO_ROOT))
 
 CSV = {
@@ -43,7 +53,7 @@ CSV = {
     "test": CORPORA / "nr3d_test.csv",
 }
 #: The teacher pool --split train subtracts; a stale name scores a model on its own rows
-POOL = ROLLOUTS / "nr3d_rollouts_fft_v4.jsonl"
+POOL = ROLLOUTS / "nr3d_rollouts_qwen_tree_v1.jsonl"
 #: Frozen train-derived dev; --n takes a prefix for smoke runs, --n 0 uses all rows
 DEV = CORPORA / "nr3d_dev.jsonl"
 RULE_PARSES = CORPORA / "nr3d.jsonl"
@@ -153,25 +163,24 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--no-think", action="store_true", help="Append ' /no_think' to prompt")
     ap.add_argument("--include-pool", action="store_true", help="Do not exclude rollout pool utterances")
-    # A checkpoint must be scored under the prompt it was trained under. The
-    # sets built by build_uniform_sets.py are v4, whose parsing rules differ from
-    # v2's (v2 still declares the `viewpoint` field v4 removed), so a v4 adapter
-    # scored under v2 measures out-of-distribution behaviour
-    ap.add_argument("--prompt", default="v4", choices=sorted(PROMPTS),
-                    help="system prompt version the checkpoint was trained "
-                         "under. v4 is the current generation; pass v2 to "
-                         "reproduce results from before that switch")
+    # A checkpoint must be scored under the prompt it was trained under
+    ap.add_argument("--prompt", default=DEFAULT_PROMPT, choices=sorted(TREE_PROMPTS),
+                    help="system prompt id the checkpoint was trained under")
     ap.add_argument("--expected-top1", action="store_true",
                     help="also record per-row tie-aware credit (model_expected, "
                          "model_tied) and its totals; model stays the "
                          "every-top-tie selection flag")
     ap.add_argument("--out", type=Path, default=None)
     add_model_args(ap)
+    add_grammar_args(ap)
     args = ap.parse_args()
+    grammar = grammar_for(args.prompt, enabled=not args.no_grammar)
 
     engine.bind(args.representation)
     picks = pick_rows(args.split, args.n, args.seed, not args.include_pool)
     generated_by = None
+    # How the scored generations were decoded; a rescore reports its source's
+    generated_grammar = grammar_record(grammar)
     if args.rescore:
         src = args.rescore if args.rescore.is_absolute() else REPO_ROOT / args.rescore
         if src.suffix == ".json":
@@ -179,15 +188,21 @@ def main() -> int:
             if prev.get("split") != args.split:
                 sys.exit(f"{src.name} is split {prev.get('split')!r}, not {args.split!r}")
             args.model, args.adapter = prev["model"], prev.get("adapter")
+            generated_grammar = prev.get("grammar")
+        else:
+            sidecar = Path(str(src) + ".meta.json")
+            prev = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+            generated_grammar = prev.get("grammar")
+        # Generations of the v4 parser are flat programs, not trees
+        if not is_tree_prompt(prev.get("prompt")):
+            sys.exit(f"{src.name} was generated under prompt "
+                     f"{prev.get('prompt')!r}, not a tree prompt")
         generated_by = str(src.relative_to(REPO_ROOT)) if src.is_relative_to(REPO_ROOT) else str(src)
     tag = Path(args.adapter or args.model).name
     out_path = REPO_ROOT / (args.out or _default_out(args.split, tag, args.expected_top1))
     print(f"{len(picks)} utterances from {args.split}, scored through the "
           f"{engine.bound()} arm")
 
-    from grounding.parsing import clean_program, extract_json_objects, lower_program
-
-    rn = rel_num()
     t0 = time.time()
     if args.rescore:
         raw = load_raw(src)
@@ -204,9 +219,10 @@ def main() -> int:
                                          device=args.device, dtype=args.dtype)
         suffix = " /no_think" if args.no_think else ""
 
-        system = PROMPTS[args.prompt]
+        system = TREE_PROMPTS[args.prompt]
         print(f"  scoring under prompt {args.prompt} "
-              f"({len(system)} chars), shared v4 SFT user turn")
+              f"({len(system)} chars), shared SFT user turn"
+              + (", tree grammar" if grammar else ""))
 
         def prompt(sentence: str):
             # user_turn rendered the targets, so the scored prompt matches training
@@ -215,7 +231,8 @@ def main() -> int:
         for i in range(0, len(picks), args.batch_size):
             chunk = picks[i:i + args.batch_size]
             resp = batch_generate(model, tok, prompts=[prompt(p["utterance"]) for p in chunk],
-                                  max_tokens=args.max_tokens, sampler=sampler, verbose=False)
+                                  max_tokens=args.max_tokens, sampler=sampler, verbose=False,
+                                  grammar=grammar)
             for p, text in zip(chunk, resp.texts):
                 p["raw"] = text.split("<|im_end|>")[0]
             if (i // args.batch_size) % 10 == 0:
@@ -233,21 +250,20 @@ def main() -> int:
 
     scenes = Scenes()
     rows, n_json = [], 0
-    
-    for p in sorted(picks, key=lambda q: q["scan_id"]):
-        parsed = extract_json_objects(p["raw"])
-        n_json += parsed is not None
-        
-        rec = {k: p[k] for k in ("dataset_idx", "scan_id", "target_label", "utterance")}
-        rec.update({"json_ok": parsed is not None, "raw": p["raw"], "program": parsed})
+    outcomes: Counter = Counter()   # ok / InvalidTree reason
 
-        for name, obj in (("model", parsed), ("rule", rule.get(p["dataset_idx"]))):
+    for p in sorted(picks, key=lambda q: q["scan_id"]):
+        # Executed as emitted, or not at all
+        parsed, executable, outcome = parse_generation(p["raw"])
+        outcomes[outcome] += 1
+        n_json += parsed is not None
+
+        rec = {k: p[k] for k in ("dataset_idx", "scan_id", "target_label", "utterance")}
+        rec.update({"json_ok": parsed is not None, "raw": p["raw"], "program": parsed,
+                    "outcome": outcome})
+
+        for name, obj in (("model", executable), ("rule", rule.get(p["dataset_idx"]))):
             hit, credit, tied = False, 0.0, None
-            if name == "model" and obj is not None:
-                try:
-                    obj = lower_program(clean_program(obj, p["utterance"], recover=False), rn)
-                except Exception:
-                    obj = None
             if obj:
                 try:
                     ids, sc = score(scenes, p["scan_id"], obj)
@@ -278,6 +294,10 @@ def main() -> int:
     print(f"  top-1 (model)   {acc}/{n} ({acc / n:.1%})")
     
     summary = {"n": n, "json_ok": n_json, "model_top1": acc}
+    summary["tree_outcomes"] = dict(outcomes.most_common())
+    print(f"  in the grammar  {outcomes['ok']}/{n}  ("
+          + ", ".join(f"{k} {v}" for k, v in outcomes.most_common() if k != "ok")
+          + ")")
     if args.expected_top1:
         expected = sum(r["model_expected"] for r in rows)
         summary["model_expected_top1"] = expected
@@ -310,6 +330,7 @@ def main() -> int:
     out_path.write_text(json.dumps({
         "split": args.split, "model": args.model, "adapter": args.adapter,
         "prompt": args.prompt,
+        "grammar": generated_grammar,
         # The arm and resolver the programs ran under; selections do not carry across them
         "resolver": resolver_config(),
         "generations_from": generated_by,

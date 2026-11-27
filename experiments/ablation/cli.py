@@ -37,6 +37,12 @@ as the others: cells are compared expression by expression.
     python -m experiments.ablation run        # the whole local grid
     python -m experiments.ablation run --parsers student teacher_qwen
     python -m experiments.ablation analyse
+
+Every parser arm is the tree parser (grammar-constrained). ``--no-grammar``
+scores every arm's unconstrained parses instead -- the grammar ablation -- and
+GPT-4o is always unconstrained. Results go to
+``artifacts/results/ablation/<split>_tree_v1[_nogrammar]``, beside the v4
+parser's results, which are never overwritten.
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ from pathlib import Path
 
 from experiments.ablation import design as D
 from experiments.ablation import stats as S
+from grounding.parsing.tree import DEFAULT_PROMPT
 from grounding.paths import REPO_ROOT, RESULTS, resolve_under_root
 from grounding.resolution.artifacts import (git_commit, parse_scores,
                                             relative_path as _rel, sha256)
@@ -64,8 +71,12 @@ MANIFEST = "cells.json"
 
 # --- inputs --------------------------------------------------------------
 
+def _constrained(args) -> bool:
+    return not getattr(args, "no_grammar", False)
+
+
 def parses_paths(args) -> dict[str, Path]:
-    paths = {name: D.default_parses(name) for name in args.parsers}
+    paths = {name: D.parses_for(name, _constrained(args)) for name in args.parsers}
     for item in args.parses or []:
         name, _, path = item.partition("=")
         if name not in D.PARSERS or not path:
@@ -85,11 +96,13 @@ def population(parses: Path) -> list[int]:
     return sorted(keys)
 
 
-def missing_teacher_commands(paths: dict[str, Path]) -> list[str]:
+def missing_teacher_commands(paths: dict[str, Path],
+                             constrained: bool = True) -> list[str]:
     lines = []
     for name, path in paths.items():
         if not path.exists() and name in D.TEACHER_PARSERS:
-            lines.append(shlex.join(D.teacher_parse_command(name, out=_rel(path))))
+            lines.append(shlex.join(D.teacher_parse_command(
+                name, out=_rel(path), constrained=constrained)))
     return lines
 
 
@@ -98,11 +111,12 @@ def missing_student_hints(paths: dict[str, Path]) -> list[str]:
             if not path.exists() and name in D.STUDENT_PARSERS]
 
 
-def check_inputs(paths: dict[str, Path], requested_split: str) -> tuple[str, list[int]]:
+def check_inputs(paths: dict[str, Path], requested_split: str,
+                 constrained: bool = True) -> tuple[str, list[int]]:
     missing = [name for name, path in paths.items() if not path.exists()]
     if missing:
         msg = [f"missing parses for: {', '.join(missing)}"]
-        teacher = missing_teacher_commands(paths)
+        teacher = missing_teacher_commands(paths, constrained)
         if teacher:
             msg += ["generate the teacher arms in the training environment:",
                     *[f"  {line}" for line in teacher]]
@@ -199,7 +213,7 @@ def score_cell(cell: D.Cell, parses: Path, split: str, totals: str,
 
 def cmd_run(args) -> int:
     paths = parses_paths(args)
-    split, keys = check_inputs(paths, args.split)
+    split, keys = check_inputs(paths, args.split, _constrained(args))
     totals = args.totals or ("official" if split == "test" else "parses")
     out_dir = out_directory(args, split)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -484,7 +498,7 @@ def cmd_plan(args) -> int:
     for name, path in paths.items():
         state = "ok" if path.exists() else "MISSING"
         print(f"  {name:<30} {D.PARSER_ARMS[name].label:<55} {_rel(path)}  [{state}]")
-    teacher = missing_teacher_commands(paths)
+    teacher = missing_teacher_commands(paths, _constrained(args))
     if teacher:
         print("\nteacher parses to generate (training environment):")
         for line in teacher:
@@ -509,7 +523,8 @@ def cmd_plan(args) -> int:
 # --- arguments -----------------------------------------------------------
 
 def out_directory(args, split: str) -> Path:
-    out = args.out_dir or (RESULTS / "ablation" / split)
+    name = f"{split}_{DEFAULT_PROMPT}" + ("" if _constrained(args) else "_nogrammar")
+    out = args.out_dir or (RESULTS / "ablation" / name)
     return resolve_under_root(out).resolve()
 
 
@@ -534,9 +549,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--totals", choices=list(TOTALS_MODES), default=None,
                        help="default: official on test, parses otherwise")
         p.add_argument("--out-dir", type=Path, default=None,
-                       help="default: artifacts/results/ablation/<split>")
+                       help="default: artifacts/results/ablation/"
+                            "<split>_tree_v1[_nogrammar]")
         p.add_argument("--n-boot", type=int, default=10_000)
         p.add_argument("--seed", type=int, default=0)
+        p.add_argument("--no-grammar", action="store_true",
+                       help="score every arm's parses decoded without the "
+                            "grammar (the grammar ablation)")
 
     p = sub.add_parser("plan", help="list cells and missing inputs")
     common(p)

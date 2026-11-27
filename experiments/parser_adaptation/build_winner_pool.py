@@ -1,8 +1,15 @@
 """Construct training winners from the R=8 keeper pool.
 
-Deduplicate canonical programs per prompt, require valid v4 targets and
-successful re-execution, then rank by cue coverage. Store margins, program size
-and difficulty for downstream sampling. Recovery rollouts do not enter SFT."""
+A winner's ``program`` is the model's tree as emitted, which
+build_uniform_sets.py writes verbatim (``tree.dumps``) as the SFT target; there
+is no vocabulary to canonicalise into. Per prompt: deduplicate, require the tree
+to pass ``to_executable`` (the grammar; rejected by reason, never repaired) and
+to have its keys in the grammar's order (``key_order``, so a target never
+teaches a layout the grammar-constrained student cannot emit), require
+successful re-execution, then rank by cue coverage (by tree relation name, at
+every level), margin and size. Store margins, size, depth and difficulty for
+downstream sampling.
+"""
 from __future__ import annotations
 
 import argparse
@@ -16,15 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from filter_rollouts import canonical, rank_and_margin              
 from grounding.data.benchmark import BOXES_DIR, load_boxes         
-from grounding.parsing import PROMPTS, clean_program, lower_program      
-from grounding.parsing import cues                                  
-from grounding.parsing.training_set import (Reject, allowed,
-                                            attribute_for_predicate,
-                                            canonicalise, size, violations)
+from grounding.parsing import tree as T
+from grounding.parsing import cues
 from grounding.paths import CORPORA, REPO_ROOT                      
 from grounding.resolution.config import DEFAULT_RESOLVER              
 from grounding.resolution import engine                    
-from grounding.resolution.engine import Scenes, rel_num, score      
+from grounding.resolution.engine import Scenes, score
 
 
 def difficulty_table(csv_path: Path) -> dict[int, dict]:
@@ -74,27 +78,30 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--keepers",
-                    default="data/distilled/nr3d_keepers_fft_v4_ext.jsonl")
-    ap.add_argument("--output",
-                    default="data/distilled/nr3d_winners_fft_v4_ext.jsonl")
-    ap.add_argument("--prompt", default="v4", choices=sorted(PROMPTS))
+                    default="data/distilled/nr3d_keepers_qwen_tree_v1_ext.jsonl")
+    ap.add_argument("--output", default=None,
+                    help="default: the --keepers name with keepers -> winners")
     ap.add_argument("--margin", type=float, default=0.0,
                     help="re-execution margin floor; 0.0 keeps every correct "
                          "program, which is the point of this pool")
-    ap.add_argument("--keep-declared-inert", action="store_true", default=False)
     ap.add_argument("--representation", dest="representation",
                     default=None, help="override; defaults to the accepting arm")
     ap.add_argument("--train-csv", default=str(CORPORA / "nr3d_train.csv"))
     args = ap.parse_args()
 
-    system = PROMPTS[args.prompt]
-    vocab = (allowed(system, "Allowed attribute names"),
-             allowed(system, "Allowed predicates"),
-             allowed(system, "Allowed colors"))
-
     src = REPO_ROOT / args.keepers
     keeper_stats = json.loads(Path(str(src) + ".stats.json").read_text())
-    rep = args.representation or keeper_stats.get("representation", "baseline")
+    prompt = keeper_stats.get("prompt")
+    if not T.is_tree_prompt(prompt):
+        raise SystemExit(f"{args.keepers} was filtered from a {prompt!r} pool, "
+                         "not a tree prompt")
+    if args.output is None:
+        if "keepers" not in Path(args.keepers).name:
+            raise SystemExit("cannot name the winners for "
+                             f"{args.keepers!r}; pass --output")
+        args.output = str(Path(args.keepers).with_name(
+            Path(args.keepers).name.replace("keepers", "winners", 1)))
+    rep = args.representation or keeper_stats.get("representation", "extended")
     engine.bind(rep)
 
     # R=8 keepers only: mixing recovery keepers would make coverage and budget one variable
@@ -102,12 +109,8 @@ def main() -> int:
 
     difficulty = difficulty_table(Path(args.train_csv))
 
-    rn = rel_num()
-    attr_for_pred = attribute_for_predicate(vocab[0], rn)
     scenes = Scenes()
     n: Counter = Counter()
-    moves: Counter = Counter()
-    drops: Counter = Counter()
     rejects: Counter = Counter()
     n["keeper programs in"] = len(rows)
     n["keeper prompts in"] = len({r["row_idx"] for r in rows})
@@ -121,27 +124,24 @@ def main() -> int:
 
     for si, (scan_id, group) in enumerate(sorted(by_scan.items()), 1):
         for row in group:
+            # The model's tree is the target: checked, never rewritten
+            cand = row["program"]
             try:
-                cand = canonicalise(row["program"], rn, vocab, moves, drops,
-                                    args.keep_declared_inert, attr_for_pred)
-            except Reject as e:
-                rejects[e.reason] += 1
+                executable = T.to_executable(cand)
+            except T.InvalidTree as e:
+                rejects[f"invalid_{e.reason}"] += 1
                 continue
-            if violations(cand, vocab):
-                n["failed canonical schema validation"] += 1
-                rejects["schema_validation"] += 1
+            if not T.in_layout(cand):
+                rejects["key_order"] += 1
                 continue
 
             key = canonical(cand)
             if key in seen[row["row_idx"]]:
-                # Two samples differing only in spelling collapse here; they are one trajectory
-                n["duplicate canonical programs removed"] += 1
+                n["duplicate programs removed"] += 1
                 continue
 
             try:
-                lowered = lower_program(clean_program(json.loads(key), row["utterance"],
-                                            recover=False), rn)
-                ids, scores = score(scenes, scan_id, lowered)
+                ids, scores = score(scenes, scan_id, executable)
             except Exception as exc:                        # noqa: BLE001
                 n["failed re-execution"] += 1
                 rejects[f"reexec_{type(exc).__name__}"] += 1
@@ -163,17 +163,17 @@ def main() -> int:
                 "target_id": row["target_id"], "utterance": row["utterance"],
                 "stimulus_id": meta.get("stimulus_id", ""),
                 "program": cand, "canonical_key": key,
-                "margin": margin, "size": size(cand),
+                "margin": margin, "size": T.size(cand),
                 "coverage": cues.coverage(cand, row["utterance"]),
                 "cue_count": cues.cue_count(row["utterance"]),
                 "predicate_count": cues.predicate_count(cand),
+                "depth": T.depth_of(cand),
                 "word_count": len(row["utterance"].split()),
                 "is_hard": bool(meta.get("is_hard", False)),
                 "label_count": meta.get("label_count", 0),
                 "source": row["source"],
                 "sample_index": row["sample_index"],
                 "keeper_margin": row["margin"],
-                "cleaned": bool(row["cleaned"]),
             })
         scenes.drop(scan_id)
         if si % 50 == 0 or si == len(by_scan):
@@ -199,7 +199,9 @@ def main() -> int:
     stats = {
         "keepers": args.keepers, "recovery": None,
         "recovery_note": "R=8 only; the recovery diagnostic is archived",
-        "prompt": args.prompt, "representation": engine.bound(),
+        "prompt": prompt,
+        "grammar": keeper_stats.get("grammar"),
+        "representation": engine.bound(),
         "resolver": {"norm_mode": DEFAULT_RESOLVER.norm_mode,
                      "color_mode": DEFAULT_RESOLVER.color_mode,
                      "combine": DEFAULT_RESOLVER.combine,
@@ -210,8 +212,8 @@ def main() -> int:
         "by_source": dict(Counter(c["source"] for v in winners.values() for c in v)),
         "hard_prompts": sum(1 for v in winners.values() if v[0]["is_hard"]),
         "rejections": dict(rejects),
-        "transformations": dict(moves.most_common(40)),
-        "removals": dict(drops.most_common(40)),
+        "depth_of_winners": dict(sorted(Counter(
+            c["depth"] for v in winners.values() for c in v).items())),
     }
     Path(str(out_path) + ".stats.json").write_text(json.dumps(stats, indent=2))
 
