@@ -11,6 +11,12 @@ model's own ``generation_config`` (Qwen3 ships top_p=0.95, top_k=20, T=0.6) is
 overridden on purpose, so that ``--temp 0.7`` means the same thing it meant
 under MLX. Outputs are still not token-identical to MLX runs: kernels,
 quantisation and random streams differ.
+
+``batch_generate(..., grammar=gbnf)`` constrains decoding to a GBNF grammar with
+xgrammar (the tree track's ``grounding.parsing.tree.gbnf()``): an xgrammar
+logits processor masks every token that would leave the grammar, so the
+completion is always a prefix of a sentence of the grammar, and a whole one
+unless ``max_tokens`` cuts it off.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ __all__ = [
     "batch_seed",
     "free_memory",
     "pick_device",
+    "grammar_processor",
 ]
 
 
@@ -284,15 +291,57 @@ def _stop_ids(model, tokenizer) -> set[int]:
     return ids
 
 
+#: Compiled grammars, keyed by tokenizer and grammar text: compiling the tree
+#: grammar against a 150k vocabulary takes seconds, a batch should not pay it
+_COMPILED: dict = {}
+
+
+def _vocab_size(model, tokenizer) -> int:
+    """Width of the logits, which can exceed len(tokenizer) (Qwen pads it)."""
+    config = getattr(model, "config", None)
+    if config is not None and hasattr(config, "get_text_config"):
+        config = config.get_text_config()
+    size = getattr(config, "vocab_size", None)
+    return int(size) if size else len(tokenizer)
+
+
+def grammar_processor(model, tokenizer, grammar: str, stop_ids):
+    """A fresh xgrammar logits processor for one ``generate`` call.
+
+    The processor keeps one matcher per sequence, so it is single-use; the
+    compiled grammar behind it is cached. ``stop_ids`` are the tokens that may
+    end a completed sentence -- the same set ``batch_generate`` stops on.
+    """
+    try:
+        import xgrammar as xgr
+        import xgrammar.contrib.hf  # noqa: F401  (registers xgr.contrib.hf)
+    except ImportError as e:
+        raise SystemExit(
+            "grammar-constrained decoding needs xgrammar (pip install "
+            "xgrammar); pass --no-grammar to decode without it") from e
+    key = (id(tokenizer), _vocab_size(model, tokenizer), tuple(sorted(stop_ids)),
+           grammar)
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        info = xgr.TokenizerInfo.from_huggingface(
+            tokenizer, vocab_size=_vocab_size(model, tokenizer),
+            stop_token_ids=sorted(stop_ids))
+        compiled = xgr.GrammarCompiler(info).compile_grammar(grammar)
+        _COMPILED[key] = compiled
+    return xgr.contrib.hf.LogitsProcessor(compiled)
+
+
 def batch_generate(model, tokenizer, prompts: Sequence, max_tokens: int,
                    sampler: Sampler | None = None, verbose: bool = False,
-                   seed: int | None = None) -> BatchResponse:
+                   seed: int | None = None,
+                   grammar: str | None = None) -> BatchResponse:
     """Generate one completion per prompt.
 
     ``prompts`` are token-id lists (as ``encode_chat``/``template_prompt``
     return) or strings, which are tokenized without adding special tokens.
     Completions stop at the first end-of-turn token and exclude it, as the
     mlx-lm texts did. ``seed`` overrides ``sampler.seed`` for this call.
+    ``grammar`` (GBNF text) constrains every completion to that grammar.
     """
     import torch
 
@@ -327,6 +376,11 @@ def batch_generate(model, tokenizer, prompts: Sequence, max_tokens: int,
             torch.manual_seed(s)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(s)
+
+    if grammar is not None:
+        from transformers import LogitsProcessorList
+        gen_kwargs["logits_processor"] = LogitsProcessorList(
+            [grammar_processor(model, tokenizer, grammar, stop)])
 
     with torch.inference_mode():
         out = model.generate(input_ids=input_ids, attention_mask=attention,

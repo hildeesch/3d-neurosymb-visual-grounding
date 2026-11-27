@@ -17,6 +17,10 @@ min-p and every penalty llama.cpp enables by default are switched off per
 request. Every sample is its own request with its own seed. Only the Python
 standard library is needed.
 
+``grammar`` (GBNF text, e.g. the tree track's ``grounding.parsing.tree.gbnf()``)
+is sent as the request's ``grammar`` field, so llama.cpp samples only tokens
+that keep the completion inside it.
+
 Start the server first, e.g.::
 
     llama-server -m models/Qwen3-30B-A3B-Q4_K_M.gguf -ngl 99 --n-cpu-moe 20 \\
@@ -106,12 +110,14 @@ class LlamaCppServer:
 
     # -- generation -------------------------------------------------------
     def complete(self, prompt: str, *, max_tokens: int, temperature: float,
-                 seed: int | None) -> Completion:
+                 seed: int | None, grammar: str | None = None) -> Completion:
         body = {"prompt": prompt, "n_predict": max_tokens, "temperature": temperature,
                 "stop": STOP, "cache_prompt": True, "stream": False,
                 **NEUTRAL_SAMPLING}
         if seed is not None:
             body["seed"] = int(seed)
+        if grammar is not None:
+            body["grammar"] = grammar
         for attempt in range(self.retries + 1):
             try:
                 out = self._request("/completion", body)
@@ -126,7 +132,7 @@ class LlamaCppServer:
                           stop_type=out.get("stop_type"))
 
     def complete_many(self, jobs: list[tuple[str, int | None]], *, max_tokens: int,
-                      temperature: float) -> list[Completion]:
+                      temperature: float, grammar: str | None = None) -> list[Completion]:
         """``(prompt, seed)`` jobs, run concurrently; results in input order.
 
         Concurrency should match the server's ``-np`` slots: more requests
@@ -134,7 +140,8 @@ class LlamaCppServer:
         """
         with ThreadPoolExecutor(self.workers) as pool:
             futures = [pool.submit(self.complete, p, max_tokens=max_tokens,
-                                   temperature=temperature, seed=s) for p, s in jobs]
+                                   temperature=temperature, seed=s, grammar=grammar)
+                       for p, s in jobs]
             return [f.result() for f in futures]
 
 

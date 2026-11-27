@@ -38,6 +38,7 @@ training = [
     "numpy",
     "PyYAML==6.0.3",
     "openai>=1.40",         # optional GPT-4o teacher backend
+    "xgrammar>=0.2",        # tree track: grammar-constrained decoding (hf backend)
     "wandb==0.27.0",
 ]
 # 4-/8-bit weight quantisation for large teachers (Linux + NVIDIA GPU)
